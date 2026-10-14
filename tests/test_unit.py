@@ -101,6 +101,54 @@ class TestFingerprint(unittest.TestCase):
             self.skipTest("本平台 os.symlink 未产生真符号链接")
         self.assertIsNone(nk._fingerprint(link))
 
+    # ── 大小上限按扩展名分档 ──
+    # 线上真实库实测：一律用 64KB 会把 21% 的字幕（.ass/.sup 动辄几百 KB~几十 MB）
+    # 判成「不可校验」，复核直接报「计划缺少指纹快照」，计划永远删不动。
+
+    def test_accepts_large_subtitle(self):
+        for name, size in (("big.ass", 300 * 1024), ("big.sup", 3 * 1024 * 1024),
+                           ("small.srt", 4096)):
+            p = os.path.join(ENV["base"], name)
+            _common._write(p, "x" * size)
+            fp = nk._fingerprint(p, exts=nk.ALL_EXTS)
+            self.assertIsNotNone(fp, f"{name} ({size} bytes) 应可校验")
+            self.assertEqual(len(fp["sha256"]), 64)
+
+    def test_still_rejects_oversized_strm(self):
+        """strm 是几十字节的文本 —— 超 64KB 仍然是异常内容，必须拒绝。"""
+        p = os.path.join(ENV["base"], "huge.strm")
+        _common._write(p, "x" * (nk.MAX_STRM_BYTES + 1))
+        self.assertIsNone(nk._fingerprint(p, exts=nk.ALL_EXTS))
+
+    def test_subtitle_guard_survives_large_sub(self):
+        """大字幕要能进 guard，否则 validate_plan 会以「缺少指纹快照」整体中止。"""
+        tmp = tempfile.mkdtemp(prefix="nankeep-bigsub-")
+        try:
+            lib = os.path.join(tmp, "lib")
+            out = os.path.join(tmp, "out")
+            os.makedirs(out, exist_ok=True)
+            d = os.path.join(lib, "分享已整理", "电影", "其他电影", "大字幕甲 (2021)")
+            os.makedirs(d, exist_ok=True)
+            base = "大字幕甲.2021.WEB-DL.H.264.AAC"
+            _common.write_strm(os.path.join(d, base + ".1080p.strm"))
+            _common.write_strm(os.path.join(d, base + ".2160p.strm"))
+            # 字幕跟随**被淘汰**的 1080p 版本（跟随保留版的字幕不该被删）
+            _common._write(os.path.join(d, base + ".1080p.chs.ass"), "y" * (200 * 1024))
+            cfg = nk.load_cfg(ENV["conf"])
+            cfg["share_root"], cfg["out_dir"] = lib, out
+            cfg["strategy"] = dict(cfg["strategy"], quiet_minutes=0)
+            scans = nk._run_scan(cfg, lib,
+                                 [("share", nk.LIB_SHARE), ("transcode", nk.LIB_TRANSCODE)],
+                                 out, log=lambda *a: None, use_cache=False)
+            plan = nk.build_plan(nk.analyze_all(scans, cfg), nk.KIND_MOVIE, cfg)
+            act = next(a for a in plan["actions"] if "大字幕甲" in a["name"])
+            self.assertTrue(any(p.endswith(".ass") for p in act["subs"]), str(act["subs"]))
+            self.assertTrue(all(p in act["guard"] for p in act["files"]),
+                            f"files={act['files']} guard={list(act['guard'])}")
+            self.assertEqual(nk.validate_plan(plan), [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 class TestGovernanceAnalysis(unittest.TestCase):
     @classmethod

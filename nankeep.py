@@ -55,7 +55,12 @@ ALL_EXTS = VIDEO_EXTS + SUB_EXTS
 ART_NAMES = {"poster.jpg", "fanart.jpg", "clearlogo.png", "logo.png", "banner.jpg",
              "thumb.jpg", "landscape.jpg", "disc.jpg", "backdrop.jpg", "folder.jpg"}
 IGNORE_SUFFIXES = ("-thumb.jpg", "-thumb.png")
+# 指纹读取上限按扩展名分档（见 _fingerprint）：
+#   .strm 是几十字节的文本 → 64KB 已经极度宽松，超了必是异常内容；
+#   字幕不是 —— .ass 常规几百 KB、.sup 蓝光图形字幕能到几十 MB，
+#   一刀切用 64KB 会把它们判成「不可校验」，进而让整份计划卡死在复核阶段。
 MAX_STRM_BYTES = 65536
+MAX_SUB_BYTES = 64 * 1024 * 1024
 
 RE_MOVIE_DIR = re.compile(r"^(?P<title>.+?)\s*\((?P<year>\d{4})\)\s*(?:\{(?P<key>tmdbid?)[-=]\s*(?P<id>\d+)\})?\s*$")
 RE_TMDB_DIR = re.compile(r"\{tmdb(?:id)?[-=]\s*(\d+)\}")
@@ -423,6 +428,11 @@ def _fingerprint(path: str, exts=VIDEO_EXTS) -> dict | None:
 
     只接受绝对路径、无 `..`、非符号链接、后缀在 exts 内的普通文件（默认仅 .strm），
     任一条件不满足即返回 None（视为「不可校验」→ 调用方必须跳过，不得删除）。
+
+    读取上限**按扩展名分档**：`.strm` 64KB（它是几十字节的文本，超了就是异常），
+    字幕 64MB（`.ass` 常规几百 KB、`.sup` 能到几十 MB）。
+    这里曾一律用 64KB，结果真实库里 21% 的字幕被判「不可校验」，
+    复核直接报「计划缺少指纹快照」，计划永远删不动。
     """
     try:
         norm = str(path).replace("\\", "/")
@@ -434,15 +444,16 @@ def _fingerprint(path: str, exts=VIDEO_EXTS) -> dict | None:
             return None
         if os.path.islink(path):
             return None
+        cap = MAX_STRM_BYTES if path.lower().endswith(VIDEO_EXTS) else MAX_SUB_BYTES
         st0 = os.stat(path)
-        if not stat.S_ISREG(st0.st_mode) or st0.st_size > MAX_STRM_BYTES:
+        if not stat.S_ISREG(st0.st_mode) or st0.st_size > cap:
             return None
         with open(path, "rb") as f:
             st1 = os.fstat(f.fileno())
-            data = f.read(MAX_STRM_BYTES + 1)
+            data = f.read(cap + 1)
             st2 = os.fstat(f.fileno())
         a, b, c = _identity_fields(st0), _identity_fields(st1), _identity_fields(st2)
-        if len(data) > MAX_STRM_BYTES or a != b or b != c:
+        if len(data) > cap or a != b or b != c:
             return None
         if _identity_fields(os.stat(path)) != c:
             return None
