@@ -82,6 +82,18 @@ def main():
     # 双库精简专用：分享侧 4K / 转存侧 1080p（含 .zh.srt）。
     # 加在 prepare() 之后，单测的既有计数不受影响。
     _s_path, _t_path, _t_sub = _common.add_dual_pair(lib)
+    # 网盘侧专用：转存侧 strm 指向「挂载点」，挂载点上放真实 mkv + 同名字幕
+    _cs, _ct, cloud_mkv, cloud_sub, cloud_dir = _common.add_cloud_pair(lib, env_paths["base"])
+    _common.enable_remote(env_paths["conf"], env_paths["base"])
+    # 两对作品的转存侧作品目录（空目录清理的预期目标）
+    tc_dir_a = os.path.join(lib, "转存已整理", "电影", "其他电影", _common.DUAL_TITLE)
+    tc_dir_b = os.path.join(lib, "转存已整理", "电影", "其他电影", _common.CLOUD_TITLE)
+    cloud_root = _common.mount_dir(env_paths["base"])
+
+    def snap():
+        """NAS 库 + 网盘挂载点的合并快照（「没被动过」的判定要覆盖两侧）。"""
+        return {**_common.snapshot(lib), **_common.snapshot(cloud_root)}
+
     port = free_port()
     origin = f"http://127.0.0.1:{port}"
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -160,12 +172,15 @@ def main():
         check("无保留版缺失", pv.get("keep_missing") == [])
 
         print("\n== 4b. 双库精简 ==")
-        check("策略含平局档 skip", (d.get("strategy") or {}).get("tie_keep") == "skip",
+        check("策略含平局档 share（画质一致时保分享、省网盘空间）",
+              (d.get("strategy") or {}).get("tie_keep") == "share",
               str((d.get("strategy") or {}).get("tie_keep")))
         dual = [a for a in d["actions"] if a.get("scope") == "cross"]
-        check("计划含 1 个双库动作", len(dual) == 1, f"got {len(dual)}")
-        if dual:
-            a0 = dual[0]
+        check("计划含 2 个双库动作", len(dual) == 2, f"got {len(dual)}")
+        a0 = next((a for a in dual if "跨库甲" in a["name"]), None)
+        a1 = next((a for a in dual if "网盘乙" in a["name"]), None)
+        check("两个双库作品都在计划里", a0 is not None and a1 is not None)
+        if a0:
             check("双库动作淘汰转存侧",
                   a0.get("side") == "loc" and
                   all("转存已整理" in p for p in a0["files"]), str(a0.get("side")))
@@ -178,18 +193,48 @@ def main():
                   str([p.split("/")[-1] for p in a0["files"]]))
             check("字幕单列在 subs 里", len(a0.get("subs") or []) == 1 and
                   (a0["subs"][0] or "").endswith(".zh.srt"), str(a0.get("subs")))
+            check("转存侧作品目录待清空", a0.get("rmdirs") == [tc_dir_a],
+                  str(a0.get("rmdirs")))
             # guard 指纹不外泄给前端（只在校验链内部用），所以这里用复核结果反证：
             # 复核 executable 为真 ⇒ 每个文件（含字幕）都有匹配的指纹快照。
             check("字幕已纳入复核范围", pv.get("total_files") == files,
                   f"{pv.get('total_files')} vs {files}")
 
+        print("\n== 4c. 网盘侧（CD2 挂载点）与空目录 ==")
+        if a1:
+            rem = [os.path.basename(p) for p in a1.get("remote") or []]
+            check("网盘源文件进计划", sorted(rem) == sorted([_common.CLOUD_MKV,
+                                                        _common.CLOUD_SUB]), str(rem))
+            check("分享侧 302 直链不进网盘清单",
+                  not any("分享已整理" in p for p in a1["remote"]))
+            check("网盘侧待清空目录", a1.get("remote_rmdirs") == [os.path.normpath(cloud_dir)],
+                  str(a1.get("remote_rmdirs")))
+            check("NAS 侧作品目录待清空", a1.get("rmdirs") == [tc_dir_b],
+                  str(a1.get("rmdirs")))
+            check("网盘指纹快照不外泄给前端", "remote_guard" not in a1)
+            check("复核统计含网盘文件数", pv.get("remote_files") == 2,
+                  str(pv.get("remote_files")))
+            check("计划详情汇总网盘待删数", d.get("remote_total") == 2,
+                  str(d.get("remote_total")))
+            check("计划详情汇总待清目录数", d.get("dirs_total") == 3,
+                  str(d.get("dirs_total")))
+        else:
+            for n in ("网盘源文件进计划", "网盘侧待清空目录", "NAS 侧作品目录待清空"):
+                check(n, False, "未找到网盘乙动作")
+
         print("\n== 5. dry-run ==")
-        before = _common.snapshot(lib)
+        before = snap()
+        nas_before = _common.snapshot(lib)
+        cloud_before = _common.snapshot(cloud_root)
         s, r = call(op, port, f"/api/plan/{pid}/execute", "POST", {"dry_run": True},
                     headers={"Origin": origin})
         t = wait_task(op, port, r["task_id"])
         check("dry-run 成功", t["status"] == "success")
-        check("dry-run 未删任何文件", _common.snapshot(lib) == before)
+        check("dry-run 未删任何文件", snap() == before)
+        res = t.get("result") or {}
+        check("dry-run 报表含网盘计划数", res.get("remote_planned") == 2,
+              str(res.get("remote_planned")))
+        check("dry-run 未真删网盘", res.get("remote_removed") == 0)
 
         print("\n== 6. 确认短语 ==")
         s, r = call(op, port, f"/api/plan/{pid}/execute", "POST",
@@ -197,7 +242,7 @@ def main():
         t = wait_task(op, port, r["task_id"])
         check("错误短语被拒", (t.get("result") or {}).get("status") == "rejected",
               str((t.get("result") or {}).get("message")))
-        check("被拒后文件完好", _common.snapshot(lib) == before)
+        check("被拒后文件完好", snap() == before)
 
         print("\n== 7. 真删 ==")
         s, r = call(op, port, f"/api/plan/{pid}/execute", "POST",
@@ -206,11 +251,16 @@ def main():
         t = wait_task(op, port, r["task_id"])
         res = t.get("result") or {}
         check("执行完成", t["status"] == "success" and res.get("status") == "done", str(res))
-        check("实删数 = 计划文件数", res.get("removed") == files, str(res))
+        check("实删数 = 计划文件数（NAS 侧）", res.get("removed") == files, str(res))
         check("无删除失败", res.get("failed") == [])
-        after = _common.snapshot(lib)
-        check("净删数正确", len(before) - len(after) == files,
-              f"{len(before)}->{len(after)}")
+        after = snap()
+        nas_after = _common.snapshot(lib)
+        cloud_after = _common.snapshot(cloud_root)
+        check("NAS 净删数正确", len(nas_before) - len(nas_after) == files,
+              f"{len(nas_before)}->{len(nas_after)} vs {files}")
+        check("网盘净删数 = 2（mkv + 同名字幕）",
+              len(cloud_before) - len(cloud_after) == 2,
+              f"{len(cloud_before)}->{len(cloud_after)}")
         kept = [p for p in after if "影片甲 (2020)" in p]
         check("多版本影片只剩最优", len(kept) == 1 and "2160p" in kept[0], str(kept))
         single = [p for p in after if "影片丙 (2019)" in p]
@@ -220,6 +270,24 @@ def main():
         check("双库：转存侧已删（含同名字幕）",
               not any("跨库甲" in p and "转存已整理" in p for p in after),
               str([p for p in after if "跨库甲" in p]))
+
+        print("\n== 7b. 网盘侧删除与空目录清理 ==")
+        check("网盘源文件已删", res.get("remote_removed") == 2, str(res.get("remote_removed")))
+        check("网盘删除无失败", res.get("remote_failed") == [])
+        check("无因网盘失败而保留的 strm", res.get("remote_deferred") == 0)
+        check("网盘 mkv 已从挂载点消失", not os.path.exists(cloud_mkv))
+        check("网盘同名字幕已删", not os.path.exists(cloud_sub))
+        check("网盘作品目录已清空", not os.path.exists(cloud_dir), cloud_dir)
+        check("NAS 侧转存作品目录已清空（两对）",
+              not os.path.exists(tc_dir_a) and not os.path.exists(tc_dir_b),
+              f"{os.path.exists(tc_dir_a)} {os.path.exists(tc_dir_b)}")
+        check("空目录计数 = 3（两对 NAS + 1 网盘）", res.get("dirs_removed") == 3,
+              str(res.get("dirs_removed")))
+        check("分类目录未被误删",
+              os.path.isdir(os.path.join(lib, "转存已整理", "电影", "其他电影")))
+        check("分享侧作品目录保留",
+              os.path.isdir(os.path.join(lib, "分享已整理", "电影", "其他电影",
+                                         _common.CLOUD_TITLE)))
 
         print("\n== 8. 一次性 ==")
         s, r = call(op, port, f"/api/plan/{pid}/execute", "POST",
@@ -257,12 +325,19 @@ def main():
         check("含产物新鲜度", isinstance(ov.get("index"), dict) and ov["index"].get("exists") is True)
         check("含计划与审计", isinstance(ov.get("plans"), list) and isinstance(ov.get("audit"), list))
         check("含可写探测与版本", "writable" in ov and bool(ov.get("version")))
+        check("总览下发网盘清理状态",
+              (ov.get("remote") or {}).get("enabled") is True and
+              bool((ov.get("remote") or {}).get("host_prefix")),
+              str(ov.get("remote")))
+        check("总览不泄露网盘指纹",
+              "remote_guard" not in json.dumps(ov) and "mtime_ns" not in json.dumps(ov))
 
         print("\n== 11. 静态资源 ==")
         for path, needle in (("/static/index.html", "nankeep"),
                              ("/static/app.css", "--brand"),
                              ("/static/js/core.js", "NK.api"),
                              ("/static/js/views.js", "NK.register"),
+                             ("/static/js/settings.js", "NK.register"),
                              ("/static/favicon.svg", "<svg")):
             s, txt = call(op, port, path, raw=True)
             b = txt.decode("utf-8", "replace") if isinstance(txt, bytes) else str(txt)
@@ -283,6 +358,83 @@ def main():
         check("执行后仍可正常起任务", s == 200, f"{s} {r.get('message')}")
         if s == 200:
             wait_task(op, port, r["task_id"])
+
+        print("\n== 12b. 设置页（/data/settings.json 覆盖层） ==")
+        s, st0 = call(op, port, "/api/settings")
+        check("设置接口可用", s == 200 and st0.get("status") == "ok", f"got {s}")
+        check("九维齐全且带中文标签",
+              len(st0.get("dims") or []) == 9 and
+              all(x.get("label") for x in st0["dims"]), str(st0.get("dims", [])[:2]))
+        check("三档枚举都下发", all(st0.get("choices", {}).get(k)
+                              for k in ("unknown", "decision", "tie_keep", "match")),
+              str(sorted((st0.get("choices") or {}).keys())))
+        check("设置目录可写", st0.get("writable") is True, str(st0.get("writable")))
+        base_tie = (st0.get("settings") or {}).get("strategy", {}).get("tie_keep")
+        check("默认平局档为 share", base_tie == "share", str(base_tie))
+        sig0 = st0.get("rule_sig")
+
+        s, bad = call(op, port, "/api/settings", "POST",
+                      {"settings": {"strategy": {"season_replace_ratio": 9}}},
+                      headers={"Origin": origin})
+        check("非法设置被拒 400", s == 400 and bad.get("errors"), f"got {s} {bad}")
+        s, st1 = call(op, port, "/api/settings")
+        check("被拒后设置未落盘",
+              (st1.get("settings") or {}).get("strategy", {}).get("season_replace_ratio") != 9)
+        s, _ = call(op, port, "/api/settings", "POST",
+                    {"settings": {"quality": {"unknown": "best"}}},
+                    headers={"Origin": origin})
+        check("非法枚举被拒", s == 400, f"got {s}")
+        s, st_stray = call(op, port, "/api/settings", "POST",
+                           {"settings": {"unknown": "best"}}, headers={"Origin": origin})
+        check("设置段写错位置被拒（不静默忽略）", s == 400 and st_stray.get("errors"),
+              f"got {s} {st_stray}")
+
+        # 建一个 TV 计划，用来验证「改设置 → 旧计划作废」
+        s, r = call(op, port, "/api/task/plan", "POST",
+                    {"kind": "tv", "min_confidence": "weak", "use_cache": True},
+                    headers={"Origin": origin})
+        t2 = wait_task(op, port, r["task_id"])
+        pid2 = (t2.get("result") or {}).get("plan_id")
+        check("TV 计划已生成", bool(pid2) and (t2.get("result") or {}).get("files") > 0,
+              str(t2.get("result")))
+        s, pv2 = call(op, port, f"/api/plan/{pid2}/preview", "POST", {},
+                      headers={"Origin": origin})
+        check("改设置前计划可执行", pv2.get("executable") is True, str(pv2.get("message")))
+
+        s, ok = call(op, port, "/api/settings", "POST",
+                     {"settings": {"strategy": {"tie_keep": "local"},
+                                   "quality": {"enabled": {"release_group": True}}}},
+                     headers={"Origin": origin})
+        check("合法设置落盘", s == 200 and ok.get("status") == "ok", f"got {s} {ok}")
+        check("生效值已更新",
+              (ok.get("settings") or {}).get("strategy", {}).get("tie_keep") == "local",
+              str((ok.get("settings") or {}).get("strategy")))
+        check("九维开关已更新",
+              (ok.get("settings") or {}).get("quality", {}).get("enabled",
+                                                             {}).get("release_group") is True)
+        check("rule_sig 随设置变化", ok.get("rule_sig") != sig0,
+              f"{sig0} -> {ok.get('rule_sig')}")
+        check("报表提示作废的待执行计划", ok.get("voided") == 1, str(ok.get("voided")))
+        s, pv3 = call(op, port, f"/api/plan/{pid2}/preview", "POST", {},
+                      headers={"Origin": origin})
+        check("改设置后旧计划被拒", s == 200 and pv3.get("status") == "rejected",
+              str(pv3.get("message")))
+        check("作废原因指向配置变更", "作废" in (pv3.get("message") or ""),
+              str(pv3.get("message")))
+        check("计划状态置 stale",
+              call(op, port, f"/api/plan/{pid2}")[1].get("state") == "stale")
+
+        s, rs = call(op, port, "/api/settings", "POST", {"reset": True},
+                     headers={"Origin": origin})
+        check("重置回配置文件默认", s == 200 and rs.get("reset") is True, f"got {s}")
+        check("重置后平局档回落", call(op, port, "/api/settings")[1].get(
+            "settings", {}).get("strategy", {}).get("tie_keep") == "share")
+        s, _ = call(op, port, "/api/settings", "POST", {"settings": {}},
+                    headers={"Origin": origin})
+        check("空补丁被拒", s == 400, f"got {s}")
+        s, _ = call(op, port, "/api/settings", "POST",
+                    {"settings": {"strategy": {"tie_keep": "local"}}})
+        check("设置写请求需同源", s == 403, f"got {s}")
 
         print("\n== 13. 登出 ==")
         call(op, port, "/api/logout", "POST")

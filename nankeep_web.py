@@ -62,6 +62,9 @@ ROOT = os.environ.get("NANKEEP_ROOT", "/data/strm/nanshare").rstrip("/")
 DATA_DIR = os.environ.get("NANKEEP_DATA", "/data").rstrip("/")
 OUT_DIR = (os.environ.get("NANKEEP_OUT", "").strip() or f"{DATA_DIR}/out").rstrip("/")
 CONFIG_PATH = (os.environ.get("NANKEEP_CONFIG", "").strip() or f"{HERE}/nankeep.config.json")
+# 界面可写的那层设置（挂进容器的 config.json 通常是只读的，所以单独放 /data）
+SETTINGS_FILE = (os.environ.get("NANKEEP_SETTINGS", "").strip()
+                 or f"{DATA_DIR}/settings.json")
 SESSION_DAYS = int(os.environ.get("NANKEEP_SESSION_DAYS", "30"))
 PLAN_TTL_MIN = int(os.environ.get("NANKEEP_PLAN_TTL_MIN", "120"))
 CONFIRM_PHRASE = (os.environ.get("NANKEEP_CONFIRM_PHRASE", "").strip() or "删除这些 strm 文件")
@@ -435,7 +438,7 @@ def csrf_blocked(method, headers, has_cookie):
 # ─────────────────────────── 精简业务 ───────────────────────────
 
 def load_cfg():
-    cfg = nk.load_cfg(CONFIG_PATH)
+    cfg = nk.load_cfg(CONFIG_PATH, SETTINGS_FILE)
     cfg["share_root"] = ROOT
     cfg["out_dir"] = OUT_DIR
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -443,10 +446,14 @@ def load_cfg():
 
 
 def rule_sig(cfg):
-    """画质或双库精简策略变化时，让旧计划作废。"""
+    """画质、双库精简策略或网盘清理配置变化时，让旧计划作废。
+
+    `remote` 必须在内：计划生成后把网盘清理关掉，若签名不变，旧计划仍会去删
+    网盘源文件 —— 那是用户已经撤回的授权。
+    """
     sub = {k: cfg.get(k) for k in
            ("unknown", "order", "enabled", "tiers", "release_groups",
-            "strategy")}
+            "strategy", "remote")}
     blob = json.dumps(sub, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
@@ -684,7 +691,10 @@ def check_keep_alive(plan, task):
 
 
 def unlink_strm(path):
-    """删单个 strm。优先 dir_fd（父目录被换掉也不误删），不可用则回退普通 unlink。"""
+    """删单个文件。优先 dir_fd（父目录被换掉也不误删），不可用则回退普通 unlink。
+
+    NAS 上的 strm/字幕与 CD2 挂载上的网盘源文件都走这里 —— 都是普通文件。
+    """
     d, base = os.path.split(path)
     if hasattr(os, "supports_dir_fd") and os.unlink in os.supports_dir_fd:
         fd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -696,15 +706,36 @@ def unlink_strm(path):
         os.unlink(path)
 
 
-def execute_plan(task, pid, dry_run=True, confirm=""):
-    plan, err = guard_plan(pid, need_confirm=confirm, dry_run=dry_run)
-    if err:
-        task.emit(f"中止：{err}")
-        return {"status": "rejected", "message": err}
+def try_rmdir(d, task, remote=False):
+    """只有目录确实空了才删；非空或失败都静默跳过，绝不影响主流程。"""
+    tag = "空目录(网盘)" if remote else "空目录"
+    try:
+        if os.listdir(d):
+            return 0
+        os.rmdir(d)
+        task.emit(f"  已删{tag} {d}")
+        return 1
+    except OSError as e:
+        task.emit(f"  · {tag}未清 {d}（{e}）")
+        return 0
+
+
+def execute_actions(task, plan, dry_run=True, pid=None):
+    """删除主体（闸门 6 之后）：网盘源文件 → NAS 文件 → 空目录。
+
+    从 execute_plan 里拆出来，一是让「先删网盘、删不净则保留 strm」这条顺序
+    可以被单测直接压测，二是保证它与计划库/确认短语等状态闸门解耦。
+
+    pid 必须显式传入：计划 payload 里**没有** id 字段，回落取值会拿不到，
+    结果 `set_plan_state` 静默写空、计划永远停在 pending。
+    """
+    pid = pid or plan.get("id") or plan.get("plan_id") or "-"
 
     total = sum(len(a.get("files", [])) for a in plan["actions"])
+    remote_total = sum(len(a.get("remote") or []) for a in plan["actions"])
     verb = "预演" if dry_run else "执行"
-    task.emit(f"{verb}计划 {pid}：{len(plan['actions'])} 部 / {total} 个文件")
+    extra = f" + 网盘源文件 {remote_total}" if remote_total else ""
+    task.emit(f"{verb}计划 {pid}：{len(plan['actions'])} 部 / {total} 个文件{extra}")
 
     # 闸门 6：逐文件指纹复核（TOCTOU）。任一处不一致 → 整体中止，不部分放行。
     bad = nk.validate_plan(plan)
@@ -721,17 +752,46 @@ def execute_plan(task, pid, dry_run=True, confirm=""):
     actions, skipped = check_keep_alive(plan, task)
 
     removed, failed, would, cancelled = 0, [], 0, False
+    remote_removed, remote_failed, dirs_removed, remote_deferred = 0, [], 0, 0
     try:
         with mutation_lock():                                # 闸门 9：独占
             for a in actions:
                 task.emit(f"保留 [{a['name']}] → {a['keep']}")
+                remote = a.get("remote") or []
+                if dry_run:
+                    for p in remote:
+                        would += 1
+                        task.emit(f"  [dry·网盘] {p}")
+                    for p in a["files"]:
+                        would += 1
+                        task.emit(f"  [dry] {p}")
+                    for d in (a.get("remote_rmdirs") or []) + (a.get("rmdirs") or []):
+                        task.emit(f"  [dry·空目录] {d}")
+                    continue
+                # ① 先删网盘源文件：删不干净就**保留该作品的 strm**
+                #    （strm 还指向存活的网盘文件，删掉反而制造死链）
+                ok_remote = True
+                for p in remote:
+                    if task.cancel_requested:
+                        raise TaskCancelled()
+                    try:
+                        unlink_strm(p)
+                        remote_removed += 1
+                        task.emit(f"  已删(网盘) {p}")
+                    except OSError as e:
+                        ok_remote = False
+                        remote_failed.append({"path": p, "error": f"{type(e).__name__}: {e}"})
+                        task.emit(f"  ✗ 网盘删除失败 {p}（{e}）")
+                if not ok_remote:
+                    remote_deferred += 1
+                    failed.append({"path": a.get("dir") or a["name"],
+                                   "error": "网盘源文件未删净，已保留对应 strm"})
+                    task.emit("  → 网盘侧未清干净：跳过该作品的 strm 删除（保留 strm）")
+                    continue
+                # ② 删 NAS 侧文件（strm + 同名字幕）
                 for p in a["files"]:
                     if task.cancel_requested:
                         raise TaskCancelled()
-                    if dry_run:
-                        would += 1
-                        task.emit(f"  [dry] {p}")
-                        continue
                     try:
                         unlink_strm(p)
                         removed += 1
@@ -739,6 +799,11 @@ def execute_plan(task, pid, dry_run=True, confirm=""):
                     except OSError as e:
                         failed.append({"path": p, "error": f"{type(e).__name__}: {e}"})
                         task.emit(f"  ✗ 删除失败 {p}（{e}），继续下一个")
+                # ③ 空目录：先网盘侧再 NAS 侧，计划里已按深→浅排好
+                for d in (a.get("remote_rmdirs") or []):
+                    dirs_removed += try_rmdir(d, task, remote=True)
+                for d in (a.get("rmdirs") or []):
+                    dirs_removed += try_rmdir(d, task)
     except MutationBusy as e:
         task.emit(str(e))
         return {"status": "busy", "message": str(e)}
@@ -748,9 +813,17 @@ def execute_plan(task, pid, dry_run=True, confirm=""):
     result = {"status": ("cancelled" if cancelled else
                          "dry_run" if dry_run else "done"),
               "planned": total, "removed": removed, "would_remove": would,
+              "remote_planned": remote_total, "remote_removed": remote_removed,
+              "remote_failed": remote_failed, "remote_deferred": remote_deferred,
+              "dirs_removed": dirs_removed,
               "failed": failed, "skipped_titles": skipped}
     detail = (f"{verb}{'（已取消）' if cancelled else ''}：命中 {total} / "
               f"实删 {removed} / 失败 {len(failed)} / 跳过作品 {len(skipped)}")
+    if remote_total:
+        detail += (f"；网盘源文件 {remote_removed}/{remote_total}"
+                   f"（未删净而保留 strm 的作品 {remote_deferred}）")
+    if dirs_removed:
+        detail += f"；空目录 {dirs_removed}"
     task.emit(detail)
     STORE.add_audit("执行清理", f"计划 {pid} {detail}", detail,
                     {"plan_id": pid, "result": result, "skipped": skipped},
@@ -758,6 +831,14 @@ def execute_plan(task, pid, dry_run=True, confirm=""):
     if not dry_run and not cancelled:
         STORE.set_plan_state(pid, "done", result)
     return result
+
+
+def execute_plan(task, pid, dry_run=True, confirm=""):
+    plan, err = guard_plan(pid, need_confirm=confirm, dry_run=dry_run)
+    if err:
+        task.emit(f"中止：{err}")
+        return {"status": "rejected", "message": err}
+    return execute_actions(task, plan, dry_run=dry_run, pid=pid)
 
 
 # ─────────────────────────── Markdown → HTML ───────────────────────────
@@ -1094,6 +1175,16 @@ def r_overview(h, q):
         "rule_sig": rule_sig(cfg),
         "quality": {k: cfg.get(k) for k in ("unknown", "order", "enabled")},
         "strategy": cfg.get("strategy") or {},
+        # 「这次执行会不会连网盘上的真实文件一起删」是总览页最该一眼看到的事，
+        # 所以把 remote 的开关状态与关键分支一并下发（不下发指纹等内部字段）。
+        "remote": {
+            "enabled": bool((cfg.get("remote") or {}).get("enabled")),
+            "host_prefix": (cfg.get("remote") or {}).get("host_prefix") or "",
+            "delete_source": bool((cfg.get("remote") or {}).get("delete_source")),
+            "delete_sidecars": bool((cfg.get("remote") or {}).get("delete_sidecars")),
+            "clean_empty_dirs": bool((cfg.get("remote") or {}).get("clean_empty_dirs")),
+            "writable": _dir_writable(os.path.dirname(SETTINGS_FILE)),
+        },
         "catalog": {"movie": nk.KIND_MOVIE, "tv": nk.KIND_TV},
     })
 
@@ -1140,6 +1231,11 @@ def r_plan_detail(h, q, pid):
         "drop": a.get("drop", []), "drop_detail": a.get("drop_detail") or [],
         "files": a.get("files", []),
         "subs": a.get("subs") or [],
+        # 网盘侧（转存已整理 → 挂载点上的真实文件）与待清空的目录。
+        # remote_guard 是校验链内部用的指纹快照，**不外泄**给前端。
+        "remote": a.get("remote") or [],
+        "rmdirs": a.get("rmdirs") or [],
+        "remote_rmdirs": a.get("remote_rmdirs") or [],
         "confidence": a.get("confidence"), "decided_by": a.get("decided_by"),
         "reason": a.get("reason"),
         "reason_label": a.get("reason_label") or "",
@@ -1150,7 +1246,11 @@ def r_plan_detail(h, q, pid):
              "expired": rec["expires"] < time.time(), "summary": rec["summary"],
              "strategy": plan.get("strategy"), "result": rec.get("result"),
              "confirm_phrase": CONFIRM_PHRASE,
-             "total_files": sum(len(a["files"]) for a in actions), "actions": actions})
+             "total_files": sum(len(a["files"]) for a in actions),
+             "remote_total": sum(len(a["remote"]) for a in actions),
+             "dirs_total": sum(len(a["rmdirs"]) + len(a["remote_rmdirs"])
+                               for a in actions),
+             "actions": actions})
 
 
 def r_plan_preview(h, q, pid):
@@ -1170,6 +1270,7 @@ def r_plan_preview(h, q, pid):
                              "keep_path": a.get("keep_path"), "missing": missing})
     h._json({"status": "ok", "executable": not bad and not keep_bad,
              "total_files": sum(len(a.get("files", [])) for a in plan["actions"]),
+             "remote_files": sum(len(a.get("remote") or []) for a in plan["actions"]),
              "titles": len(plan["actions"]), "mismatch": bad[:200],
              "keep_missing": keep_bad, "confirm_phrase": CONFIRM_PHRASE})
 
@@ -1285,6 +1386,113 @@ def r_audit_detail(h, q, rid):
     h._json({"status": "ok", "record": rec})
 
 
+def r_settings(h, q):
+    """当前生效的设置（含分层来源），供设置页渲染。"""
+    if h.need_auth():
+        return
+    over = _read_json(SETTINGS_FILE) or {}
+    h._json({"status": "ok",
+             "settings": nk.editable_view(load_cfg()),
+             # 三层来源：代码默认 ← config.json ← settings.json。
+             # 界面据此标出「这一项被哪一层改过」。
+             "defaults": nk.editable_view(nk.load_cfg(None)),
+             "file_layer": nk.editable_view(nk.load_cfg(CONFIG_PATH)),
+             "overrides": over,
+             "dims": [{"key": d, "label": nk.DIM_LABEL.get(d, d)} for d in nk.DIM_ORDER],
+             "choices": {
+                 "unknown": nk.UNKNOWN_CHOICES,
+                 "decision": nk.DECISION_CHOICES,
+                 "tie_keep": list(nk.dom.TIE_CHOICES),
+                 "multi_season_protect": nk.PROTECT_CHOICES,
+                 "special_action": nk.SPECIAL_CHOICES,
+                 "match": nk.MATCH_CHOICES,
+                 "tier_unknown": nk.TIER_UNKNOWN,
+             },
+             "writable": _dir_writable(os.path.dirname(SETTINGS_FILE)),
+             "settings_file": SETTINGS_FILE,
+             "config_file": CONFIG_PATH,
+             "rule_sig": rule_sig(load_cfg()),
+             "pending_plans": STORE.count_pending()})
+
+
+_DIRW_CACHE = {}
+
+
+def _dir_writable(d: str) -> bool:
+    """目录可写探测（真写一个探针文件）。带 60s 缓存 —— 总览是轮询接口，
+    每 8 秒写一次临时文件没必要。"""
+    now = time.time()
+    hit = _DIRW_CACHE.get(d)
+    if hit and now - hit[0] < 60.0:
+        return hit[1]
+    ok = False
+    try:
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, ".nankeep_write_probe")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("1")
+        os.unlink(p)
+        ok = True
+    except OSError:
+        ok = False
+    _DIRW_CACHE[d] = (now, ok)
+    return ok
+
+
+def r_settings_save(h, q):
+    """局部更新设置（写 /data/settings.json 覆盖层）。
+
+    先合并 + 全量校验，通过了才落盘 —— 半份生效的规则比没改更危险。
+    写入会改变 rule_sig，既有 pending 计划随之作废（这是刻意的：不能让新规则
+    去执行旧计划）。
+    """
+    if h.need_auth() or h.need_origin():
+        return
+    body = h._body()
+    if body.get("reset"):
+        try:
+            os.unlink(SETTINGS_FILE)
+        except OSError:
+            pass
+        eff = load_cfg()
+        STORE.add_audit("修改设置", "重置为配置文件默认", "已删除设置覆盖层", {}, ok=1)
+        return h._json({"status": "ok", "reset": True,
+                        "settings": nk.editable_view(eff),
+                        "rule_sig": rule_sig(eff), "voided": STORE.count_pending()})
+    patch = body.get("settings")
+    if not isinstance(patch, dict):
+        patch = {k: v for k, v in body.items() if k != "reset"}
+    if not patch:
+        return h._json({"status": "error", "errors": ["没有可修改的设置项"]}, 400)
+    # 顶层段落必须写对：把 unknown 写成顶层（正确位置是 quality.unknown）不该静默通过，
+    # 否则用户会以为「已经改了」。
+    stray = sorted(set(patch) - set(nk.SETTING_SECTIONS))
+    if stray:
+        return h._json({"status": "error",
+                        "errors": ["未知的设置段：" + ", ".join(stray) +
+                                   "（只能是 " + " / ".join(nk.SETTING_SECTIONS) + "）"]},
+                       400)
+    # ① 合并出「最终生效配置」 ② 全量校验 ③ 只有通过才落盘
+    eff = load_cfg()
+    over = _read_json(SETTINGS_FILE) or {}
+    over_new = nk.deep_merge(over, patch)
+    nk.apply_cfg(eff, over_new)
+    errs = nk.validate_cfg(eff)
+    if errs:
+        return h._json({"status": "error", "errors": errs}, 400)
+    if not _dir_writable(os.path.dirname(SETTINGS_FILE)):
+        return h._json({"status": "error",
+                        "errors": [f"设置目录不可写：{os.path.dirname(SETTINGS_FILE)}"]},
+                       500)
+    _write_json(SETTINGS_FILE, over_new)
+    STORE.add_audit("修改设置", "界面更新设置",
+                    json.dumps(patch, ensure_ascii=False)[:2000],
+                    {"patch": patch, "rule_sig": rule_sig(eff)}, ok=1)
+    h._json({"status": "ok", "settings": nk.editable_view(eff),
+             "overrides": over_new, "rule_sig": rule_sig(eff),
+             "voided": STORE.count_pending()})
+
+
 ROUTES = {
     ("GET", "/"): r_index,
     ("GET", "/api/health"): r_health,
@@ -1295,6 +1503,8 @@ ROUTES = {
     ("GET", "/api/plans"): r_plans,
     ("GET", "/api/audit"): r_audit,
     ("GET", "/api/logs"): r_logs,
+    ("GET", "/api/settings"): r_settings,
+    ("POST", "/api/settings"): r_settings_save,
     ("POST", "/api/login"): r_login,
     ("POST", "/api/logout"): r_logout,
     ("POST", "/api/task/scan"): r_task_scan,

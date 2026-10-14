@@ -49,12 +49,19 @@ def tie_verdict(tie_keep):
     return tie_keep if tie_keep in TIE_CHOICES else "skip"
 
 
-def verdict_of(result, tie_keep):
-    """单次比较结果（1/-1/0）→ 三态裁决。"""
+def verdict_of(result, tie_keep, comparable=True):
+    """单次比较结果（1/-1/0）→ 三态裁决。
+
+    comparable=False 表示两侧规格都读不出有效档位（不可比）：
+    此时 result 必然是 0，但那是「都没信息」而不是「一样好」——
+    不套用平局档，一律 skip。
+    """
     if result > 0:
         return "share"
     if result < 0:
         return "local"
+    if not comparable:
+        return "skip"
     v = tie_verdict(tie_keep)
     return v if v in ("share", "local") else "skip"
 
@@ -92,23 +99,37 @@ def movie_verdict(s_key, l_key, decision, cmp, tie_keep):
     """电影整片：返回 'share'（删转存）/ 'local'（删分享）/ 'skip'（不动）。
 
     先看决策模型（keep_local / keep_share），否则按逐维对比；
-    全部打平才落到平局档 —— 默认 skip，不删。
+    逐维全部打平才落到平局档。cmp 可返回 int 或 (int, comparable) ——
+    后者用于区分「真打平」与「规格都读不出」。
     """
     if decision == "keep_local":
         return "local"
     if decision == "keep_share":
         return "share"
-    return verdict_of(cmp(s_key, l_key), tie_keep)
+    r = cmp(s_key, l_key)
+    comparable = True
+    if isinstance(r, tuple):
+        r, comparable = r[0], bool(r[1])
+    return verdict_of(r, tie_keep, comparable)
 
 
 def season_compare(s_files, l_files, *, name_of, ep_of, cmp, tie_keep, compare_meta):
     """逐集对齐比较分享与本地同一季（单向择优）。同集号多份时取各自最优参与比较。
 
-    返回 dict：s_eps / l_eps / s_only / l_only / common / s_better / l_better /
-              n_tie / decisive / sample / s_complete / l_complete / complete
+    cmp(a_name, b_name) 返回 int，或 (int, comparable) —— 后者用于区分
+    「真打平」与「规格都读不出（不可比）」。
 
-    s_better / l_better 只统计**分胜负**的集；打平计入 n_tie，不偏袒任何一侧。
+    返回 dict：s_eps / l_eps / s_only / l_only / common / s_better / l_better /
+              n_tie / n_incomparable / n_comparable_tie / decisive / sample /
+              s_complete / l_complete / complete
+
+    s_better / l_better 只统计**分胜负**的集；打平计入 n_tie，不偏袒任何一侧；
+    其中「双方都读不出规格」的打平另计 n_incomparable。
     """
+    def _c(a, b):
+        r = cmp(a, b)
+        return (r[0], bool(r[1])) if isinstance(r, tuple) else (r, True)
+
     s_eps, l_eps = {}, {}
     for f in (s_files or []):
         ep = ep_of(f)
@@ -116,41 +137,45 @@ def season_compare(s_files, l_files, *, name_of, ep_of, cmp, tie_keep, compare_m
         if not ep or ep[0] <= 0 or ep[1] <= 0:
             continue
         old = s_eps.get(ep[1])
-        if old is None or cmp(name_of(f), name_of(old)) > 0:
+        if old is None or _c(name_of(f), name_of(old))[0] > 0:
             s_eps[ep[1]] = f
     for f in (l_files or []):
         ep = ep_of(f)
         if not ep or ep[0] <= 0 or ep[1] <= 0:
             continue
         old = l_eps.get(ep[1])
-        if old is None or cmp(name_of(f), name_of(old)) > 0:
+        if old is None or _c(name_of(f), name_of(old))[0] > 0:
             l_eps[ep[1]] = f
     s_keys, l_keys = set(s_eps), set(l_eps)
     common = s_keys & l_keys
     # 代表集：优先取第一个「分胜负」的共同集，让界面能展示决胜依据；全平则取第一集
     sample = None
     for e in sorted(common):
-        if cmp(name_of(s_eps[e]), name_of(l_eps[e])) != 0:
+        if _c(name_of(s_eps[e]), name_of(l_eps[e]))[0] != 0:
             sample = e
             break
     if sample is None and common:
         sample = min(common)
-    s_better = l_better = n_tie = 0
+    s_better = l_better = n_tie = n_incomparable = 0
     for e in common:
-        v = verdict_of(cmp(name_of(s_eps[e]), name_of(l_eps[e])), "skip")
-        if v == "share":
+        r, ok = _c(name_of(s_eps[e]), name_of(l_eps[e]))
+        if r > 0:
             s_better += 1
-        elif v == "local":
+        elif r < 0:
             l_better += 1
         else:
             n_tie += 1
+            if not ok:
+                n_incomparable += 1
     s_complete, l_complete = side_complete(s_keys), side_complete(l_keys)
     return {
         "s_eps": s_eps, "l_eps": l_eps,
         "s_only": sorted(s_keys - l_keys),
         "l_only": sorted(l_keys - s_keys),
         "common": common, "s_better": s_better, "l_better": l_better,
-        "n_tie": n_tie, "decisive": s_better + l_better,
+        "n_tie": n_tie, "n_incomparable": n_incomparable,
+        "n_comparable_tie": n_tie - n_incomparable,
+        "decisive": s_better + l_better,
         "sample": (dict(compare_meta(name_of(s_eps[sample]), name_of(l_eps[sample])),
                         episode=sample) if sample is not None else None),
         "s_complete": s_complete,
@@ -165,16 +190,22 @@ def season_verdict(cmp, has_local, has_share, replace_ratio, tie_keep="skip"):
     返回 dict：
       residual_local / residual_share : 是否产生「残次品」删除动作（可同时为真）
       outcome :
-        'incomplete'          任一侧不完整 → 只处理残次品，不再比画质
+        'incomplete'          两侧都不完整（或残缺侧未被另一侧完全覆盖）→ 只处理残次品
         'no_common'           无共同集号 → 静默
-        'share_wins'          分胜负的集里分享达标率 ≥ 阈值且集数不少于本地 → 删本地
+        'share_wins'          分胜负的集里分享达标率 ≥ 阈值 → 删转存
         'local_wins_fewer'    分享集数少于本地 → 淘汰分享（集数优先）
-        'local_wins_quality'  分胜负的集里本地赢面更大 → 淘汰分享
-        'ambiguous_skip'      分享不达标、但也不弱于本地（多为打平）→ 不动
-        'tie_skip'/'tie_local'/'tie_share'  全部打平 → 按平局档（默认不动）
+        'local_wins_quality'  集数相同、本地赢面更大 → 淘汰分享
+        'ambiguous_skip'      说不清谁更好 → 不动
+        'incomparable_skip'   全部打平且没有一集双方都能读出规格 → 不动
+        'tie_skip'/'tie_local'/'tie_share'  全部可比打平 → 按平局档
 
-    关键点：**达标率的分母只算分胜负的集**。若一整季的规格都读不出来，
-    过去会被判成「转存更优 → 删分享」，现在一律落到 tie_* / ambiguous_skip，什么都不删。
+    三条优先序：
+      ① 完整性：一方缺集且被另一方完全覆盖 → 由 residual_* 处理，不看画质；
+      ② 集数：分享更全时绝不删分享（独有集号不可替代）；
+      ③ 画质：集数相同才允许「转存更优 → 淘汰分享」。
+
+    另：达标率的分母只算**分胜负的集**。若一整季的规格都读不出来，
+    过去会被判成「转存更优 → 删分享」，现在一律落到 tie_* / incomparable_skip，什么都不删。
     """
     res_l, res_s = residual_flags(cmp, has_local, has_share)
     out = {"residual_local": res_l, "residual_share": res_s}
@@ -188,13 +219,21 @@ def season_verdict(cmp, has_local, has_share, replace_ratio, tie_keep="skip"):
     s_total, l_total = len(cmp["s_eps"]), len(cmp["l_eps"])
     decisive = cmp["decisive"]
     if decisive == 0:
-        out["outcome"] = "tie_" + tie_verdict(tie_keep)
+        # 全部打平：可比打平才套平局档；「都读不出规格」的平局一律不动
+        if cmp.get("n_comparable_tie", cmp["n_tie"]) == 0:
+            out["outcome"] = "incomparable_skip"
+        else:
+            out["outcome"] = "tie_" + tie_verdict(tie_keep)
         return out
     share_ratio = cmp["s_better"] / decisive
     if share_ratio >= replace_ratio and s_total >= l_total:
         out["outcome"] = "share_wins"
-    elif s_total < l_total:
+    elif l_total > s_total:
+        # 转存更全 → 淘汰分享（集数优先）
         out["outcome"] = "local_wins_fewer"
+    elif s_total > l_total:
+        # 分享更全但画质不达标 → 保集数，不动
+        out["outcome"] = "ambiguous_skip"
     elif cmp["l_better"] > cmp["s_better"]:
         out["outcome"] = "local_wins_quality"
     else:

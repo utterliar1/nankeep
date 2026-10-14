@@ -30,12 +30,20 @@
   },
   "strategy": {
     "decision": "quality_first",
-    "tie_keep": "skip",
+    "tie_keep": "share",
     "season_replace_ratio": 0.9,
     "multi_season_protect": "compare",
     "special_action": "compare",
     "exempt_keywords": [],
     "quiet_minutes": 15,
     "match": "title_year"
+  },
+  "remote": {
+    "enabled": false,
+    "host_prefix": "",
+    "container_prefix": "/cloud",
+    "delete_source": true,
+    "delete_sidecars": true,
+    "clean_empty_dirs": true
   }
 }

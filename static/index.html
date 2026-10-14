@@ -7,6 +7,18 @@
 <meta name="theme-color" content="#007aff">
 <meta name="referrer" content="same-origin">
 <title>nankeep · strm 库精简</title>
+<!-- 首屏定色：深色变量只在 html[data-theme="dark"] 下生效，属性必须尽早落下，
+     否则「跟随系统深色」会先闪一帧白、并且只在用户手动点过切换后才变深。 -->
+<script>
+try {
+  var t = localStorage.getItem("nk-theme");
+  if (t !== "dark" && t !== "light") {
+    t = (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches)
+        ? "dark" : "light";
+  }
+  document.documentElement.setAttribute("data-theme", t);
+} catch (e) { /* 隐私模式：交给默认浅色 */ }
+</script>
 <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/static/app.css">
 </head>
@@ -78,6 +90,7 @@
             <div class="status-line"><span>索引</span><b id="rtIndex" data-tone="unknown">—</b></div>
             <div class="status-line"><span>报告</span><b id="rtReport" data-tone="unknown">—</b></div>
             <div class="status-line"><span>待执行计划</span><b id="rtPlans" data-tone="unknown">—</b></div>
+            <div class="status-line"><span>网盘清理</span><b id="rtRemote" data-tone="unknown">—</b></div>
             <div class="status-line"><span>当前任务</span><b id="rtTask" data-tone="unknown">—</b></div>
             <div class="status-line"><span>数据库</span><b id="rtDb" data-tone="unknown">—</b></div>
             <div class="status-line"><span>版本</span><b id="rtVer" data-tone="unknown">—</b></div>
@@ -257,6 +270,11 @@
         </section>
       </section>
 
+      <!-- ⑥ 设置 -->
+      <section class="view" id="view-settings">
+        <div id="setBody"></div>
+      </section>
+
       <div class="empty hidden" id="viewEmpty"></div>
     </div>
   </main>
@@ -280,6 +298,7 @@
 
 <script src="/static/js/core.js"></script>
 <script src="/static/js/views.js"></script>
+<script src="/static/js/settings.js"></script>
 <script>NK.start();</script>
 </body>
 </html>

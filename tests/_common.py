@@ -75,6 +75,11 @@ def _write(path, text):
         f.write(text)
 
 
+def write_strm(path, content=None):
+    """写一个 strm：content=None 用默认 302 直链，否则写调用方给的本地路径。"""
+    _write(path, (SRM_URL if content is None else content) + "\n")
+
+
 def build_library(base):
     """在 base 下造一个最小的 分享已整理 / 转存已整理 库。返回库根路径。"""
     lib = os.path.join(base, "lib")
@@ -133,6 +138,56 @@ def add_dual_pair(lib, title=DUAL_TITLE, share_file=DUAL_SHARE_FILE,
         sub_path = os.path.join(t_dir, tc_sub)
         _write(sub_path, "1\n00:00:01,000 --> 00:00:02,000\n测试字幕\n")
     return s_path, t_path, sub_path
+
+
+# ── 网盘侧（转存已整理 → CD2 挂载点上的真实文件）专用夹具 ──
+#
+# 生产里转存侧 strm 写的是网盘挂载点的**宿主路径**，容器里靠 remote.host_prefix /
+# container_prefix 映射。测试用同一个临时目录兼作两者，避免依赖真实挂载。
+CLOUD_HOST = "/vol1/1000/emby/strm/CloudNAS/CloudDrive"
+
+CLOUD_TITLE = "网盘乙 (2020) {tmdbid-7002}"
+CLOUD_SHARE_FILE = "网盘乙.2020.2160p.WEB-DL.HEVC.DDP5.1.strm"
+CLOUD_TC_FILE = "网盘乙.2020.1080p.WEB-DL.H.264.AAC.strm"
+CLOUD_MKV = "网盘乙.2020.1080p.WEB-DL.H.264.AAC.mkv"
+CLOUD_SUB = "网盘乙.2020.1080p.WEB-DL.H.264.AAC.zh.srt"
+CLOUD_REL = "电影/其他电影/" + CLOUD_TITLE
+
+
+def mount_dir(base):
+    """临时目录里充当 CD2 挂载点的位置。"""
+    return os.path.join(base, "cloud-mnt")
+
+
+def add_cloud_pair(lib, base):
+    """再放一对：分享侧 4K（URL）+ 转存侧 1080p（strm 指向网盘挂载点）。
+
+    返回 (分享strm, 转存strm, 网盘mkv, 网盘字幕, 网盘作品目录)。
+    """
+    s_path = os.path.join(lib, "分享已整理", "电影", "其他电影", CLOUD_TITLE,
+                          CLOUD_SHARE_FILE)
+    t_path = os.path.join(lib, "转存已整理", "电影", "其他电影", CLOUD_TITLE,
+                          CLOUD_TC_FILE)
+    cdir = os.path.join(mount_dir(base), *CLOUD_REL.split("/"))
+    mkv = os.path.join(cdir, CLOUD_MKV)
+    sub = os.path.join(cdir, CLOUD_SUB)
+    write_strm(s_path)
+    write_strm(t_path, CLOUD_HOST + "/" + CLOUD_REL + "/" + CLOUD_MKV)
+    _write(mkv, "MKV\n")
+    _write(sub, "SRT\n")
+    return s_path, t_path, mkv, sub, cdir
+
+
+def enable_remote(conf_path, base, **over):
+    """给已写好的 config.json 补上 remote 段（宿主前缀 → 临时假挂载点）。"""
+    with open(conf_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    cfg["remote"] = {"enabled": True, "host_prefix": CLOUD_HOST,
+                     "container_prefix": mount_dir(base),
+                     "delete_source": True, "delete_sidecars": True,
+                     "clean_empty_dirs": True}
+    cfg["remote"].update(over)
+    _write(conf_path, json.dumps(cfg, ensure_ascii=False, indent=2))
 
 
 def prepare(conf_phrase="删除这些 strm 文件"):

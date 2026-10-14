@@ -38,7 +38,19 @@
     play: '<path d="m6 4 14 8-14 8V4Z"/>',
     scale: '<path d="M12 4v16"/><path d="M4 8h16"/><path d="m7 8 3 6H4l3-6Z"/>' +
            '<path d="m17 8 3 6h-6l3-6Z"/>',
-    refresh: '<path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/>'
+    refresh: '<path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/>',
+    sliders: '<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/>' +
+             '<circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/>' +
+             '<circle cx="18" cy="18" r="2"/>',
+    layers: '<path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 13 9 5 9-5"/>',
+    cloud: '<path d="M7 18a4 4 0 0 1-.6-8 5.5 5.5 0 0 1 10.5 1.4A3.6 3.6 0 0 1 17 18H7Z"/>' +
+           '<path d="M12 12v5"/><path d="m10 14.5 2 2 2-2"/>',
+    folder: '<path d="M3 7a2 2 0 0 1 2-2h3.6l2 2H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/>',
+    up: '<path d="M12 19V5"/><path d="m6 11 6-6 6 6"/>',
+    down: '<path d="M12 5v14"/><path d="m6 13 6 6 6-6"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>',
+    save: '<path d="M5 3h11l3 3v15H5V3Z"/><path d="M9 3v6h6V3"/><path d="M8 15h8"/>',
+    undo: '<path d="M4 8h10a5 5 0 0 1 0 10H8"/><path d="m4 8 4-4M4 8l4 4"/>'
   };
   var icon = NK.icon = function (name) {
     var d = P[name] || P.file;
@@ -98,6 +110,29 @@
   };
 
   /* ── Toast ── */
+  /* 复制到剪贴板：优先 navigator.clipboard（需 https/localhost），
+     失败回落 execCommand —— 局域网 http 直连时前者不可用。 */
+  NK.copy = function (text, okMsg) {
+    function done(ok) { NK.toast(ok ? (okMsg || "已复制") : "复制失败，请手动选择文本", ok ? "ok" : "err"); }
+    function fallback() {
+      try {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.cssText = "position:fixed;top:-1000px;opacity:0";
+        document.body.appendChild(ta);
+        ta.select();
+        var ok = document.execCommand("copy");
+        ta.remove();
+        done(ok);
+      } catch (e) { done(false); }
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { done(true); },
+                                              function () { fallback(); });
+    } else { fallback(); }
+  };
+
   NK.toast = function (msg, kind, ms) {
     var box = $("#toastRoot");
     if (!box) return;
@@ -116,29 +151,44 @@
 
   /* ── 主题 ── */
   var media = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+  function saved() {
+    try {
+      var t = localStorage.getItem("nk-theme");
+      return (t === "dark" || t === "light") ? t : null;
+    } catch (e) { return null; }
+  }
   function themeNow() {
     var t = document.documentElement.getAttribute("data-theme");
-    if (t) return t;
-    return media && media.matches ? "dark" : "light";
+    return t || (media && media.matches ? "dark" : "light");
   }
+  function apply(t) { document.documentElement.setAttribute("data-theme", t); }
   function paintTheme() {
     var dark = themeNow() === "dark";
     var txt = $("#themeText");
     if (txt) txt.textContent = dark ? "浅色模式" : "深色模式";
     var btn = $("#themeBtnSide");
     if (btn) btn.title = dark ? "切换到浅色" : "切换到深色";
+    var tb = $("#themeBtn");
+    if (tb) tb.title = dark ? "当前：深色（点击切浅色）" : "当前：浅色（点击切深色）";
   }
   NK.initTheme = function () {
-    try {
-      var t = localStorage.getItem("nk-theme");
-      if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
-    } catch (e) { /* 隐私模式下忽略 */ }
+    // 没显式选过就跟随系统；index.html 里的内联脚本已经先把属性落了，
+    // 这里只做兜底（比如内联脚本被 CSP 挡掉）。
+    if (!document.documentElement.getAttribute("data-theme")) {
+      apply(saved() || (media && media.matches ? "dark" : "light"));
+    }
     paintTheme();
-    if (media && media.addEventListener) media.addEventListener("change", paintTheme);
+    if (media && media.addEventListener) {
+      media.addEventListener("change", function () {
+        if (saved()) return;                 // 用户显式选过就不再跟随系统
+        apply(media.matches ? "dark" : "light");
+        paintTheme();
+      });
+    }
   };
   NK.toggleTheme = function () {
     var next = themeNow() === "dark" ? "light" : "dark";
-    document.documentElement.setAttribute("data-theme", next);
+    apply(next);
     try { localStorage.setItem("nk-theme", next); } catch (e) { /* ignore */ }
     paintTheme();
   };
@@ -341,6 +391,9 @@
     statusLine("rtReport", rep.exists ? NK.ago(rep.mtime) : "未生成", rep.exists ? "ok" : "unknown");
     var pend = (ov && ov.plans_pending) || 0;
     statusLine("rtPlans", pend ? pend + " 个待执行" : "无", pend ? "warn" : "ok");
+    var rm = (ov && ov.remote) || {};
+    statusLine("rtRemote", rm.enabled ? "已启用 · 会删网盘源文件" : "未启用",
+               rm.enabled ? "warn" : "ok");
     statusLine("rtTask", busy ? (busy.kind || "任务") + " 执行中" : "空闲", busy ? "run" : "ok");
     statusLine("rtDb", (ov && ov.root) ? "ok" : "—", (ov && ov.root) ? "ok" : "unknown");
     statusLine("rtVer", (ov && ov.version) || "dev", "unknown");

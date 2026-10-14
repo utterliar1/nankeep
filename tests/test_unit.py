@@ -8,10 +8,13 @@
 """
 import json
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -280,11 +283,14 @@ class _DualFixture(unittest.TestCase):
                                  cls.out, log=lambda *a: None, use_cache=False)
 
     @classmethod
-    def add(cls, lib, cat, title, filename, subs=()):
+    def add(cls, lib, cat, title, filename, subs=(), content=None):
+        """造一个作品目录。content=None → 默认的 302 直链占位内容。
+
+        网盘侧用例需要写「挂载点本地路径」样式的内容，故开放此参数。
+        """
         d = os.path.join(cls.root, lib, "电影", cat, title)
         os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, filename), "w", encoding="utf-8", newline="\n") as f:
-            f.write(_common.SRM_URL + "\n")
+        _common.write_strm(os.path.join(d, filename), content)
         for s in subs:
             with open(os.path.join(d, s), "w", encoding="utf-8", newline="\n") as f:
                 f.write("1\n00:00:01,000 --> 00:00:02,000\n字幕\n")
@@ -301,23 +307,25 @@ class _DualFixture(unittest.TestCase):
 
 
 class TestTieKeep(_DualFixture):
-    """平局档：规格读不出来时，绝不能默认「删转存」。"""
+    """平局档：只有「双方都读得出规格且逐维相同」才套平局档；
+    读不出规格的平局一律不动（不可比 ≠ 一样好）。"""
 
     suite_name = "tie-lib"
 
     @classmethod
     def build(cls):
-        # ① 两边规格一字不差 → 九维全平
+        # ① 两边规格一字不差 → 九维全平（可比）
         f = "平局甲.2020.1080p.WEB-DL.H.264.AAC.strm"
         cls.add(nk.LIB_SHARE, "其他电影", "平局甲 (2020) {tmdbid-8101}", f)
         cls.add(nk.LIB_TRANSCODE, "其他电影", "平局甲 (2020) {tmdbid-8101}", f)
-        # ② 分享侧规格完全读不出、转存侧明确的 4K —— 历史回归：曾判「删转存」
+        # ② 分享侧规格完全读不出、转存侧明确的 4K —— 不可比，绝不能判「删转存」
         cls.add(nk.LIB_SHARE, "其他电影", "平局乙 (2021) {tmdbid-8102}", "平局乙.2021.xx.strm")
         cls.add(nk.LIB_TRANSCODE, "其他电影", "平局乙 (2021) {tmdbid-8102}",
                  "平局乙.2021.2160p.WEB-DL.HEVC.DDP5.1.strm")
 
-    def test_default_tie_keep_is_skip(self):
-        self.assertEqual(nk._strategy({})["tie_keep"], "skip")
+    def test_default_tie_keep_is_share(self):
+        """默认平局档 = share：画质一致时保留分享、淘汰转存，省网盘空间。"""
+        self.assertEqual(nk._strategy({})["tie_keep"], "share")
 
     def test_legacy_bool_tie_keep_local_still_honored(self):
         self.assertEqual(nk._strategy({"strategy": {"tie_keep_local": True}})["tie_keep"], "local")
@@ -325,17 +333,23 @@ class TestTieKeep(_DualFixture):
         self.assertNotIn("tie_keep_local",
                          nk._strategy({"strategy": {"tie_keep_local": True}}))
 
-    def test_exact_tie_makes_no_action(self):
-        self.assertEqual([a for a in self.actions() if "平局甲" in a["name"]], [])
-
-    def test_unreadable_share_spec_makes_no_action(self):
-        """核心回归：分享侧规格读不出 + 转存侧明确 4K，默认档什么都不删。"""
-        self.assertEqual([a for a in self.actions() if "平局乙" in a["name"]], [])
-
-    def test_tie_keep_share_deletes_transcode(self):
-        a = next(a for a in self.actions(tie_keep="share") if "平局甲" in a["name"])
+    def test_exact_tie_keeps_share(self):
+        """规格完全一致的平局 → 删转存、保留分享（省网盘空间）。"""
+        a = next(a for a in self.actions() if "平局甲" in a["name"])
         self.assertEqual(a["side"], nk.SIDE_LOC)
         self.assertTrue(all(nk.LIB_TRANSCODE in p for p in a["files"]))
+        self.assertTrue(all(nk.LIB_SHARE in p for p in a["keep_paths"]))
+
+    def test_exact_tie_skip_when_configured(self):
+        """显式设回 skip 时，平局恢复「谁都不删」。"""
+        self.assertEqual([a for a in self.actions(tie_keep="skip") if "平局甲" in a["name"]], [])
+
+    def test_unreadable_share_spec_makes_no_action(self):
+        """核心回归：分享侧规格读不出 + 转存侧明确 4K —— 即使平局档是 share 也不删。
+
+        这是「可比性」闸门：读不出 ≠ 一样好，不能拿平局档当删转存的依据。
+        """
+        self.assertEqual([a for a in self.actions() if "平局乙" in a["name"]], [])
 
     def test_tie_keep_local_deletes_share(self):
         a = next(a for a in self.actions(tie_keep="local") if "平局甲" in a["name"])
@@ -347,9 +361,25 @@ class TestTieKeep(_DualFixture):
             a = next(a for a in self.actions(decision=decision) if "平局甲" in a["name"])
             self.assertEqual(a["side"], side)
 
-    def test_tie_counter_reported(self):
-        _acts, stats = nk.analyze_dual(self.scans, self.cfg, with_guard=False)
-        self.assertGreaterEqual(stats["tie"], 2)
+    def test_comparability_counts_reported(self):
+        """不可比平局单独计数，且不产生动作。"""
+        acts, stats = nk.analyze_dual(self.scans, self.cfg, with_guard=False)
+        self.assertGreaterEqual(stats["incomparable"], 1)
+        self.assertGreaterEqual(stats["cross"], 1)
+        self.assertEqual([a for a in acts if "平局乙" in a["name"]], [])
+
+    def test_unknown_worst_compares_normally(self):
+        """unknown=worst 时未识别按最差档参与，不再算「不可比」。
+
+        注意副作用：这就是 StrimKeep 的原始口径 —— 命名更啰嗦的一侧系统性获胜，
+        所以「分享侧读不出 + 转存侧 4K」会判转存更优、**淘汰分享**。
+        nankeep 默认的 unknown=skip 正是为了规避它。
+        """
+        cfg = dict(self.cfg)
+        cfg["unknown"] = "worst"
+        acts, _stats = nk.analyze_dual(self.scans, cfg, with_guard=False)
+        a = next(a for a in acts if "平局乙" in a["name"])
+        self.assertEqual(a["side"], nk.SIDE_SHR)
 
 
 class TestDualDedupe(_DualFixture):
@@ -426,6 +456,546 @@ class TestSubsFollowDelete(_DualFixture):
         got = nk._sibling_subs(os.path.join(d, "字幕甲.2020.1080p.WEB-DL.H.264.AAC.strm"))
         self.assertEqual([os.path.basename(p) for p in got],
                          ["字幕甲.2020.1080p.WEB-DL.H.264.AAC.zh.srt"])
+
+
+# ─────────────────── 网盘侧源文件 + 空目录清理 ───────────────────
+
+# 模拟 CD2 挂载：strm 内容里的宿主前缀（= NAS 上的挂载点路径）
+CLOUD_HOST = "/vol1/1000/emby/strm/CloudNAS/CloudDrive"
+
+
+class TestRemoteTarget(unittest.TestCase):
+    """strm 内容 → 网盘源文件路径。铁律：分享侧的 302 直链永不触碰。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nankeep-rt-")
+        self.cfg = {"remote": {"host_prefix": CLOUD_HOST, "container_prefix": "/cloud"}}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _strm(self, content, name="a.strm"):
+        p = os.path.join(self.tmp, name)
+        _common.write_strm(p, content)
+        return p
+
+    def test_url_strm_is_never_touched(self):
+        """分享侧 strm 内容是 302 直链（指向别人的分享）→ 必须返回 None。"""
+        self.assertIsNone(nk._remote_target(self._strm(_common.SRM_URL), self.cfg))
+
+    def test_https_url_also_ignored(self):
+        self.assertIsNone(nk._remote_target(self._strm("https://pan.example/d/x.mkv"),
+                                            self.cfg))
+
+    def test_path_outside_host_prefix_ignored(self):
+        self.assertIsNone(nk._remote_target(self._strm("/mnt/other/x.mkv"), self.cfg))
+
+    def test_empty_host_prefix_disables_mapping(self):
+        """没配 host_prefix（如没挂 CD2）→ 一律不映射，绝不去猜路径。"""
+        self.assertIsNone(nk._remote_target(self._strm(CLOUD_HOST + "/x.mkv"),
+                                            {"remote": {}}))
+
+    def test_path_maps_into_container(self):
+        self.assertEqual(
+            nk._remote_target(self._strm(CLOUD_HOST + "/电影/其他电影/甲 (2020)/a.mkv"),
+                              self.cfg),
+            "/cloud/电影/其他电影/甲 (2020)/a.mkv")
+
+    def test_empty_container_prefix_uses_host_path(self):
+        """容器内与宿主同路径（如挂载点原样挂进来）→ 直接返回原路径。"""
+        self.assertEqual(
+            nk._remote_target(self._strm(CLOUD_HOST + "/x.mkv"),
+                              {"remote": {"host_prefix": CLOUD_HOST}}),
+            CLOUD_HOST + "/x.mkv")
+
+    def test_trailing_slash_on_prefixes(self):
+        self.assertEqual(
+            nk._remote_target(self._strm(CLOUD_HOST + "/x.mkv"),
+                              {"remote": {"host_prefix": CLOUD_HOST + "/",
+                                          "container_prefix": "/cloud/"}}),
+            "/cloud/x.mkv")
+
+    def test_backslash_path_not_double_slashed(self):
+        got = nk._remote_target(self._strm(CLOUD_HOST + "\\电影\\甲\\a.mkv"), self.cfg)
+        self.assertEqual(got, "/cloud/电影\\甲\\a.mkv")
+
+    def test_prefix_lookalike_not_matched(self):
+        """`/vol1/.../CloudDrive2` 不能被 `/vol1/.../CloudDrive` 前缀误命中。"""
+        self.assertIsNone(nk._remote_target(self._strm(CLOUD_HOST + "2/x.mkv"), self.cfg))
+
+    def test_missing_strm_returns_none(self):
+        self.assertIsNone(nk._remote_target(os.path.join(self.tmp, "nope.strm"), self.cfg))
+
+    def test_empty_strm_returns_none(self):
+        p = os.path.join(self.tmp, "empty.strm")
+        _common._write(p, "\n")
+        self.assertIsNone(nk._remote_target(p, self.cfg))
+
+    def test_strm_content_strips_whitespace(self):
+        p = self._strm("  " + CLOUD_HOST + "/x.mkv  ")
+        self.assertEqual(nk._strm_content(p), CLOUD_HOST + "/x.mkv")
+
+
+class TestWorkDir(unittest.TestCase):
+    """空目录清理的边界：作品目录（`Season NN` 再上一层），绝不越过分类目录。"""
+
+    def test_season_dir_bubbles_up(self):
+        self.assertEqual(nk._work_dir("/lib/电影/其他电影/剧甲 (2022)/Season 1/a.strm"),
+                         "/lib/电影/其他电影/剧甲 (2022)")
+
+    def test_season_name_variants(self):
+        for n in ("Season 02", "season 3", "SEASON 12", "Season1", "Season 10"):
+            self.assertEqual(nk._work_dir("/lib/x/剧/{}/a.strm".format(n)), "/lib/x/剧",
+                             n)
+
+    def test_movie_dir_is_plain_parent(self):
+        self.assertEqual(nk._work_dir("/lib/电影/其他电影/片甲 (2020)/a.strm"),
+                         "/lib/电影/其他电影/片甲 (2020)")
+
+    def test_title_containing_season_word_is_not_climbed(self):
+        """作品名里含「Season」但不是季目录 —— 不能多上跳一层（否则会删到分类目录）。"""
+        self.assertEqual(nk._work_dir("/lib/电影/其他电影/Season 的故事 (2020)/a.strm"),
+                         "/lib/电影/其他电影/Season 的故事 (2020)")
+
+
+class TestDirsEmptiedBy(unittest.TestCase):
+    """删除后变空的目录预测：从深到浅排序，且绝不越过作品目录。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nankeep-dirs-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _mk(self, *rel):
+        p = os.path.join(self.tmp, *rel)
+        _common.write_strm(p)
+        return p
+
+    def test_deep_first_and_stops_at_boundary(self):
+        a = self._mk("剧", "Season 1", "a.strm")
+        b = self._mk("剧", "Season 1", "b.strm")
+        got = nk._dirs_emptied_by([a, b], [os.path.join(self.tmp, "剧")])
+        self.assertEqual(got, [os.path.join(self.tmp, "剧", "Season 1"),
+                               os.path.join(self.tmp, "剧")])
+
+    def test_surviving_sibling_blocks(self):
+        a = self._mk("剧", "a.strm")
+        self._mk("剧", "keep.strm")
+        self.assertEqual(nk._dirs_emptied_by([a], [os.path.join(self.tmp, "剧")]), [])
+
+    def test_no_stops_means_no_dir_removal(self):
+        a = self._mk("剧", "Season 1", "a.strm")
+        self.assertEqual(nk._dirs_emptied_by([a], []), [])
+
+    def test_never_climbs_above_stop(self):
+        a = self._mk("分类", "剧", "Season 1", "a.strm")
+        self._mk("分类", "剧", "Season 2", "b.strm")
+        got = nk._dirs_emptied_by([a], [os.path.join(self.tmp, "分类", "剧")])
+        self.assertEqual(got, [os.path.join(self.tmp, "分类", "剧", "Season 1")])
+
+    def test_nested_season_dirs_allow_title_removal(self):
+        """TV 场景回归：Season 1/2 各自删空后，作品目录也必须被清掉。
+
+        只按「文件 victims」判定时，作品目录永远看不到自己会空（它里面装的是
+        目录而不是待删文件），于是会留下一个空壳作品目录。
+        """
+        a = self._mk("剧", "Season 1", "a.strm")
+        b = self._mk("剧", "Season 2", "b.strm")
+        got = nk._dirs_emptied_by([a, b], [os.path.join(self.tmp, "剧")])
+        self.assertEqual(set(got), {os.path.join(self.tmp, "剧", "Season 1"),
+                                    os.path.join(self.tmp, "剧", "Season 2"),
+                                    os.path.join(self.tmp, "剧")})
+        self.assertEqual(got[-1], os.path.join(self.tmp, "剧"), "作品目录必须最后删")
+
+    def test_mixed_separators_still_match(self):
+        """网盘侧路径的分隔符来自 strm 内容，未必等于 os.sep —— 归一化后才比对。"""
+        d = os.path.join(self.tmp, "甲")
+        native = self._mk("甲", "a.strm")
+        slash = d.replace(os.sep, "/") + "/a.strm"
+        self.assertEqual(nk._dirs_emptied_by([slash, native], [d]),
+                         [os.path.normpath(d)])
+
+    def test_shared_parent_reported_once(self):
+        a = self._mk("剧", "Season 1", "a.strm")
+        b = self._mk("剧", "Season 1", "b.strm")
+        got = nk._dirs_emptied_by([a, b], [os.path.join(self.tmp, "剧")])
+        self.assertEqual(len(got), len(set(got)))
+
+
+class TestRemotePlanAnnotation(_DualFixture):
+    """双库计划的网盘侧标注：转存侧 strm 指向挂载点 → 计划须带源文件与空目录。"""
+
+    suite_name = "remote-lib"
+    TITLE = "网盘甲 (2019) {tmdbid-7401}"
+    SHARE_FILE = "网盘甲.2019.2160p.WEB-DL.HEVC.DDP5.1.strm"
+    TC_FILE = "网盘甲.2019.1080p.WEB-DL.H.264.AAC.strm"
+    MKV = "网盘甲.2019.1080p.WEB-DL.H.264.AAC.mkv"
+    SUB = "网盘甲.2019.1080p.WEB-DL.H.264.AAC.zh.srt"
+    REL = "电影/其他电影/" + TITLE
+
+    @classmethod
+    def build(cls):
+        cls.host = os.path.join(cls.root, "CloudNAS", "CloudDrive")  # strm 里的宿主前缀
+        cls.mnt = os.path.join(cls.root, "cloud-mnt")                # 容器内挂载点（真实目录）
+        # 分享侧 4K（URL）→ 转存侧 1080p 被淘汰
+        cls.add(nk.LIB_SHARE, "其他电影", cls.TITLE, cls.SHARE_FILE)
+        cls.add(nk.LIB_TRANSCODE, "其他电影", cls.TITLE, cls.TC_FILE,
+                 subs=(cls.TC_FILE[:-5] + ".zh.srt",),
+                 content=cls.host + "/" + cls.REL + "/" + cls.MKV)
+        # 网盘上的真实文件 + 同名附属（挂载点目录就是 cls.mnt）
+        _common._write(os.path.join(cls.mnt, cls.REL, cls.MKV), "MKV\n")
+        _common._write(os.path.join(cls.mnt, cls.REL, cls.TC_FILE[:-5] + ".zh.srt"), "SRT\n")
+
+    def setUp(self):
+        # 有的用例会删掉/改掉网盘侧夹具文件（验复核链），逐个用例前重建，避免互相污染
+        _common._write(os.path.join(self.mnt, self.REL, self.MKV), "MKV\n")
+        _common._write(os.path.join(self.mnt, self.REL,
+                                    self.TC_FILE[:-5] + ".zh.srt"), "SRT\n")
+
+    def _cfg(self, **remote):
+        cfg = dict(self.cfg)
+        cfg["remote"] = dict(nk.REMOTE_DEFAULT)
+        cfg["remote"].update({"enabled": True, "host_prefix": self.host,
+                              "container_prefix": self.mnt})
+        cfg["remote"].update(remote)
+        return cfg
+
+    def _plan(self, **remote):
+        return nk.build_plan(nk.analyze_all(self.scans, self._cfg(**remote)),
+                             nk.KIND_MOVIE, self._cfg(**remote))
+
+    def _act(self, plan):
+        return next(a for a in plan["actions"] if "网盘甲" in a["name"])
+
+    def test_remote_default_is_disabled(self):
+        """网盘清理是不可逆动作 —— 默认必须关。"""
+        self.assertFalse(nk.REMOTE_DEFAULT["enabled"])
+        self.assertFalse(nk.load_cfg(ENV["conf"])["remote"]["enabled"])
+
+    def test_disabled_by_default_keeps_remote_empty(self):
+        plan = nk.build_plan(nk.analyze_all(self.scans, self.cfg), nk.KIND_MOVIE, self.cfg)
+        act = self._act(plan)
+        self.assertEqual(act["remote"], [])
+        self.assertEqual(act["remote_rmdirs"], [])
+
+    def test_enabled_annotates_remote_source_and_sidecar(self):
+        act = self._act(self._plan())
+        self.assertEqual(len(act["remote"]), 2, str(act["remote"]))
+        self.assertEqual({os.path.basename(p) for p in act["remote"]},
+                         {self.MKV, self.SUB})
+        self.assertTrue(all(p.startswith(self.mnt) for p in act["remote"]))
+        # 附属文件也要有指纹快照，否则复核阶段整体中止
+        self.assertEqual(set(act["remote"]), set(act["remote_guard"]))
+
+    def test_share_side_url_is_never_in_remote(self):
+        act = self._act(self._plan())
+        self.assertFalse(any("分享已整理" in p for p in act["remote"]),
+                         "分享侧是 302 直链，不该出现在网盘删除清单里")
+
+    def test_remote_dirs_emptied_are_listed(self):
+        act = self._act(self._plan())
+        # 返回的是 normpath 后的路径（网盘侧分隔符由 strm 内容决定，必须先归一化）
+        self.assertEqual(act["remote_rmdirs"],
+                         [os.path.normpath(os.path.join(self.mnt, self.REL))])
+
+    def test_nas_dirs_emptied_are_listed(self):
+        """转存侧作品目录删完只剩空壳 → 必须进 rmdirs。"""
+        act = self._act(self._plan())
+        self.assertEqual(act["rmdirs"], [os.path.join(self.root, nk.LIB_TRANSCODE,
+                                                    "电影", "其他电影", self.TITLE)])
+
+    def test_delete_source_off_still_cleans_nas(self):
+        act = self._act(self._plan(delete_source=False))
+        self.assertEqual(act["remote"], [])
+        self.assertTrue(act["rmdirs"])
+
+    def test_clean_empty_dirs_off_skips_both(self):
+        act = self._act(self._plan(clean_empty_dirs=False))
+        self.assertEqual(act["rmdirs"], [])
+        self.assertEqual(act["remote_rmdirs"], [])
+
+    def test_delete_sidecars_off_keeps_sub(self):
+        act = self._act(self._plan(delete_sidecars=False))
+        self.assertEqual([os.path.basename(p) for p in act["remote"]], [self.MKV])
+
+    def test_validate_plan_accepts_remote_snapshot(self):
+        self.assertEqual(nk.validate_plan(self._plan()), [])
+
+    def test_validate_plan_catches_remote_drift(self):
+        """网盘文件在计划之后被换掉 → 体积/时间戳不一致必须中止。"""
+        plan = self._plan()
+        act = self._act(plan)
+        tgt = next(p for p in act["remote"] if p.endswith(".mkv"))
+        with open(tgt, "w", encoding="utf-8", newline="\n") as f:
+            f.write("被换掉的另一个文件（体积不一样）\n")
+        bad = nk.validate_plan(plan)
+        self.assertTrue(any(b["path"] == tgt and "网盘" in b["reason"] for b in bad),
+                        str(bad))
+
+    def test_validate_plan_catches_missing_remote(self):
+        plan = self._plan()
+        act = self._act(plan)
+        tgt = next(p for p in act["remote"] if p.endswith(".mkv"))
+        os.unlink(tgt)
+        bad = nk.validate_plan(plan)
+        self.assertTrue(any(b["path"] == tgt and "不存在" in b["reason"] for b in bad),
+                        str(bad))
+
+    def test_remote_fingerprint_is_lightweight(self):
+        """网盘指纹只认体积+时间戳：绝不能含 sha256（几十 GB 的影片读不动）。"""
+        fp = nk._remote_fingerprint(os.path.join(self.mnt, self.REL, self.MKV))
+        self.assertEqual(set(fp), {"size", "mtime_ns", "kind"})
+        self.assertEqual(fp["kind"], "remote")
+
+    def test_remote_fingerprint_none_for_dir_or_missing(self):
+        self.assertIsNone(nk._remote_fingerprint(os.path.join(self.mnt, self.REL)))
+        self.assertIsNone(nk._remote_fingerprint(os.path.join(self.mnt, "nope.mkv")))
+
+    def test_emit_sh_covers_remote_files_and_dirs(self):
+        """CLI 导出的脚本必须和 Web 层同语义：网盘源文件 + 空目录都要在里面。"""
+        sh = nk.emit_sh(self._plan(), ENV["lib"])
+        self.assertIn(self.MKV, sh)
+        self.assertIn(self.SUB, sh)
+        self.assertIn(os.path.normpath(os.path.join(self.mnt, self.REL)), sh)
+        self.assertIn("rmdir --", sh)
+        self.assertIn("已删-网盘", sh)
+
+    def test_emit_sh_skips_action_when_remote_fails(self):
+        """网盘删失败 → 该作品的 strm 必须整体跳过（不能只剩死链）。"""
+        plan = self._plan()
+        act = self._act(plan)
+        sh = nk.emit_sh(plan, ENV["lib"])
+        self.assertIn('if [ -n "$rmfail" ]', sh)
+        self.assertIn("网盘未删净，保留该作品的 strm", sh)
+        # 跳过分支必须在转存侧 strm 的删除语句之前判定
+        strm = next(p for p in act["files"] if p.endswith(".strm"))
+        self.assertLess(sh.index('if [ -n "$rmfail" ]'), sh.index(strm))
+
+    def test_emit_sh_still_dry_by_default_with_remote(self):
+        sh = nk.emit_sh(self._plan(), ENV["lib"])
+        self.assertIn("\nDRY=1\n", sh)
+        self.assertIn("未删除任何文件", sh)
+
+    def test_cli_apply_refuses_container_prefix(self):
+        """remote 启用 + container_prefix 是容器内路径 → CLI 在宿主上必须明确拒绝，
+        而不是让复核报一堆「网盘源文件已不存在」误导用户。"""
+        cfgp = os.path.join(self.root, "cli-refuse.json")
+        with open(cfgp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"out_dir": os.path.join(self.root, "cli-out"),
+                       "remote": dict(self._cfg()["remote"])}, f)
+        planp = os.path.join(self.root, "cli-refuse-plan.json")
+        self._plan()  # 建计划只为拿到夹具，落到磁盘上的是空动作也足以触发前置闸门
+        with open(planp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"version": 1, "kind": "movie", "actions": []}, f)
+        rc = nk.main(["--config", cfgp, "apply", "--plan", planp])
+        self.assertEqual(rc, 2)
+
+    def test_cli_apply_allows_empty_container_prefix(self):
+        """container_prefix 留空 = 计划里的网盘路径就是宿主路径 → CLI 不该被挡。"""
+        cfgp = os.path.join(self.root, "cli-ok.json")
+        cfg = self._cfg()
+        cfg["container_prefix"] = ""
+        with open(cfgp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"out_dir": os.path.join(self.root, "cli-out"), "remote": cfg}, f)
+        planp = os.path.join(self.root, "cli-ok-plan.json")
+        with open(planp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"version": 1, "kind": "movie", "actions": []}, f)
+        self.assertEqual(nk.main(["--config", cfgp, "apply", "--plan", planp]), 0)
+
+
+class TestRemoteExecute(unittest.TestCase):
+    """执行链顺序：网盘先删 → 删不净则保留 strm → 空目录按深→浅清。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nankeep-rexec-")
+        self.lib = os.path.join(self.tmp, "lib")
+        self.mnt = os.path.join(self.tmp, "cloud-mnt")
+        title = "执行甲 (2019) {tmdbid-7501}"
+        base = "执行甲.2019.1080p.WEB-DL.H.264.AAC"
+        self.rel = "电影/其他电影/" + title
+        self.tc_dir = os.path.join(self.lib, nk.LIB_TRANSCODE, "电影", "其他电影", title)
+        self.strm = os.path.join(self.tc_dir, base + ".strm")
+        self.keep = os.path.join(self.lib, nk.LIB_SHARE, "电影", "其他电影", title,
+                                 "执行甲.2019.2160p.WEB-DL.HEVC.DDP5.1.strm")
+        _common.write_strm(self.keep)
+        _common.write_strm(self.strm, "/host/cloud/" + self.rel + "/" + base + ".mkv")
+        self.mkv = os.path.join(self.mnt, self.rel, base + ".mkv")
+        _common._write(self.mkv, "MKV\n")
+        self.task = W.Task("unit-remote", "execute")
+        self.plan = {"version": 1, "id": "-", "actions": [{
+            "dir": self.tc_dir, "name": "执行甲 (2019)", "cat": "其他电影",
+            "keep": os.path.basename(self.keep), "keep_path": self.keep,
+            "files": [self.strm], "subs": [],
+            "guard": {self.strm: nk._fingerprint(self.strm, exts=nk.ALL_EXTS)},
+            "remote": [self.mkv],
+            "remote_guard": {self.mkv: nk._remote_fingerprint(self.mkv)},
+            "rmdirs": [self.tc_dir],
+            "remote_rmdirs": [os.path.join(self.mnt, self.rel)],
+        }]}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, dry_run):
+        """直击删除主体，绕开计划库/确认短语等状态闸门，只验顺序与语义。"""
+        return W.execute_actions(self.task, self.plan, dry_run=dry_run)
+
+    def test_dry_run_touches_nothing(self):
+        r = self._run(dry_run=True)
+        self.assertEqual(r["status"], "dry_run")
+        self.assertEqual((r["planned"], r["remote_planned"]), (1, 1))
+        self.assertTrue(os.path.isfile(self.strm))
+        self.assertTrue(os.path.isfile(self.mkv))
+        self.assertTrue(os.path.isdir(self.tc_dir))
+
+    def test_remote_deleted_before_strm(self):
+        """顺序铁律：先确认网盘文件已删，再动 strm —— 中间中断也不会留死链。"""
+        order, real = [], W.unlink_strm
+
+        def spy(path):
+            order.append(path)
+            return real(path)
+
+        with unittest.mock.patch.object(W, "unlink_strm", side_effect=spy):
+            self._run(dry_run=False)
+        self.assertEqual(order, [self.mkv, self.strm])
+
+    def test_real_run_deletes_remote_strm_and_dirs(self):
+        r = self._run(dry_run=False)
+        self.assertEqual(r["status"], "done")
+        self.assertEqual(r["remote_removed"], 1)
+        self.assertEqual(r["removed"], 1)
+        self.assertEqual(r["dirs_removed"], 2, str(r))
+        self.assertFalse(os.path.exists(self.mkv))
+        self.assertFalse(os.path.exists(self.strm))
+        self.assertFalse(os.path.exists(self.tc_dir))
+        self.assertFalse(os.path.exists(os.path.join(self.mnt, self.rel)))
+        self.assertTrue(os.path.isfile(self.keep), "保留版被误删")
+
+    def test_remote_failure_keeps_strm(self):
+        """网盘删不干净 → 该作品的 strm 必须保留（否则留下死链）。"""
+        real = W.unlink_strm
+
+        def flaky(path):
+            if path == self.mkv:
+                raise OSError("模拟：网盘删除失败")
+            return real(path)
+
+        with unittest.mock.patch.object(W, "unlink_strm", side_effect=flaky):
+            r = self._run(dry_run=False)
+        self.assertEqual(r["remote_deferred"], 1)
+        self.assertEqual(r["remote_removed"], 0)
+        self.assertEqual(r["removed"], 0, "网盘未删净却把 strm 删了")
+        self.assertEqual(r["dirs_removed"], 0)
+        self.assertTrue(r["failed"])
+        self.assertTrue(os.path.isfile(self.strm))
+        self.assertTrue(os.path.isfile(self.mkv))
+
+    def test_validate_aborts_before_any_delete(self):
+        """指纹复核不过 → 整体中止，网盘与 strm 都不动。"""
+        os.unlink(self.mkv)
+        r = self._run(dry_run=False)
+        self.assertEqual(r["status"], "rejected")
+        self.assertTrue(os.path.isfile(self.strm))
+        self.assertTrue(r["mismatch"])
+
+    def test_missing_keep_file_skips_action(self):
+        """fail-safe：保留版不在 → 整条动作跳过，一个文件都不删。"""
+        os.unlink(self.keep)
+        r = self._run(dry_run=False)
+        self.assertEqual(r["removed"], 0)
+        self.assertEqual(r["remote_removed"], 0)
+        self.assertTrue(os.path.isfile(self.strm))
+        self.assertTrue(os.path.isfile(self.mkv))
+        self.assertEqual(len(r["skipped_titles"]), 1)
+
+
+class TestSettings(unittest.TestCase):
+    """设置的三层装配（默认 ← config.json ← settings.json）与校验闸门。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nankeep-set-")
+        self.conf = os.path.join(self.tmp, "config.json")
+        self.over = os.path.join(self.tmp, "settings.json")
+        _common._write(self.conf, json.dumps(
+            {"strategy": {"tie_keep": "local", "quiet_minutes": 0}},
+            ensure_ascii=False))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_over(self, obj):
+        _common._write(self.over, json.dumps(obj, ensure_ascii=False))
+
+    def test_view_covers_all_nine_dims(self):
+        v = nk.editable_view(nk.load_cfg(None))["quality"]
+        self.assertEqual(list(v["enabled"]), list(nk.DIM_ORDER))
+        self.assertEqual(list(v["tiers"]), list(nk.DIM_ORDER))
+        self.assertEqual(sorted(v["order"]), sorted(nk.DIM_ORDER))
+
+    def test_layer_precedence(self):
+        self.assertEqual(nk.load_cfg(self.conf)["strategy"]["tie_keep"], "local")
+        self._write_over({"strategy": {"tie_keep": "skip"}})
+        self.assertEqual(nk.load_cfg(self.conf, self.over)["strategy"]["tie_keep"], "skip")
+
+    def test_typo_key_is_ignored_not_silently_applied(self):
+        """配置里打错字（tier vs tiers）必须被忽略，而不是留下半个生效的规则。"""
+        self._write_over({"quality": {"tier": {"resolution": ["8K"]}}})
+        self.assertEqual(nk.load_cfg(None, self.over)["tiers"], nk.TIERS_DEFAULT)
+
+    def test_broken_settings_file_falls_back_to_file_layer(self):
+        _common._write(self.over, "{ 这不是 JSON")
+        self.assertEqual(nk.load_cfg(self.conf, self.over)["strategy"]["tie_keep"], "local")
+
+    def test_deep_merge(self):
+        self.assertEqual(nk.deep_merge({"a": {"b": 1, "c": 2}}, {"a": {"c": 3}}),
+                         {"a": {"b": 1, "c": 3}})
+        self.assertEqual(nk.deep_merge({"a": [1, 2]}, {"a": [3]}), {"a": [3]})
+        self.assertEqual(nk.deep_merge(None, {"a": 1}), {"a": 1})
+
+    def test_defaults_and_file_layer_pass_validation(self):
+        for cfg in (nk.load_cfg(None), nk.load_cfg(self.conf), nk.load_cfg(ENV["conf"])):
+            self.assertEqual(nk.validate_cfg(cfg), [], str(nk.validate_cfg(cfg)))
+
+    def test_order_must_be_a_permutation(self):
+        for bad in (nk.DIM_ORDER[:-1],
+                    list(nk.DIM_ORDER) + ["resolution"],
+                    ["resolution"] * len(nk.DIM_ORDER)):
+            cfg = nk.deep_merge(nk.load_cfg(None), {"order": bad})
+            self.assertTrue(any("order" in e for e in nk.validate_cfg(cfg)), str(bad))
+
+    def test_rejects_bad_values(self):
+        for patch, needle in (
+                ({"unknown": "best"}, "unknown"),
+                ({"enabled": {"resolution": "yes"}}, "enabled"),
+                ({"enabled": {"colour": True}}, "enabled"),
+                ({"tiers": {"resolution": ["4K", ""]}}, "tiers"),
+                ({"tiers": {"colour": ["x"]}}, "tiers"),
+                ({"release_groups": "GROUP"}, "release_groups"),
+                ({"strategy": {"decision": "fastest"}}, "decision"),
+                ({"strategy": {"tie_keep": "maybe"}}, "tie_keep"),
+                ({"strategy": {"season_replace_ratio": 1.4}}, "season_replace_ratio"),
+                ({"strategy": {"season_replace_ratio": "很高"}}, "season_replace_ratio"),
+                ({"strategy": {"quiet_minutes": -1}}, "quiet_minutes"),
+                ({"strategy": {"quiet_minutes": True}}, "quiet_minutes"),
+                ({"strategy": {"match": "fuzzy"}}, "match"),
+                ({"remote": {"enabled": "yes"}}, "remote.enabled"),
+                ({"remote": {"host_prefix": 1}}, "host_prefix"),
+        ):
+            cfg = nk.deep_merge(nk.load_cfg(None), patch)
+            errs = nk.validate_cfg(cfg)
+            self.assertTrue(any(needle in e for e in errs), f"{patch} → {errs}")
+
+    def test_remote_enabled_requires_host_prefix(self):
+        cfg = nk.deep_merge(nk.load_cfg(None), {"remote": {"enabled": True}})
+        self.assertTrue(any("host_prefix" in e for e in nk.validate_cfg(cfg)))
+        ok = nk.deep_merge(cfg, {"remote": {"host_prefix": "/vol1/emby/strm/CloudNAS"}})
+        self.assertEqual(nk.validate_cfg(ok), [])
+
+    def test_ratio_string_number_is_accepted(self):
+        cfg = nk.deep_merge(nk.load_cfg(None), {"strategy": {"season_replace_ratio": "0.8"}})
+        self.assertEqual(nk.validate_cfg(cfg), [])
 
 
 class TestMatchEntry(unittest.TestCase):

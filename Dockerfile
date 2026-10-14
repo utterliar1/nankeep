@@ -27,10 +27,17 @@ COPY --chown=1000:1000 static/ ./static/
 RUN chmod -R a+rX /app \
     && mkdir -p /data/out && chown -R 1000:1000 /data
 
-# 非 root 运行。实测（2026-10-14，NAS 上 docker run 验证）：
-# uid 1000 在容器内即可对库目录 touch/cp/rm——包括 root:root 700 属主的目录，
-# 与该宿主账号在容器外的行为一致（fnOS 对 Administrators 组的存储层特权，不随容器边界失效）。
-USER 1000:1000
+# ── 运行用户 ──
+# 默认 **root**：转存侧 strm 指向 CD2 / OpenList 等 FUSE 挂载点上的真实文件，
+# 那些文件在宿主上是 root:root 755 + `default_permissions`，uid 1000 写不了
+# （实测 Permission denied，root 可以）。要删网盘源文件就必须是 root。
+#
+# 只要不启用 remote（不删网盘文件），可以改回最小权限运行：
+#   在 compose 里加   user: "1000:1000"
+# /data 已 chown 给 1000，两种模式都能用。
+# 参考 2026-10-14 实测：fnOS 对 Administrators 组的存储层特权不随容器边界失效，
+# 所以 uid 1000 删 NAS 上的 strm 仍然没问题 —— 只有 FUSE 挂载点需要 root。
+USER root
 
 ENV NANKEEP_DATA=/data \
     NANKEEP_OUT=/data/out \

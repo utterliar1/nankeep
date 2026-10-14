@@ -19,6 +19,25 @@
                      stale: "已作废（配置变更）", voided: "已作废", error: "异常" };
   var STATE_PILL = { pending: "warn", done: "ok", expired: "plain",
                      stale: "plain", voided: "plain", error: "err" };
+  /* reason 是后端的机器 token，reason_label 才是给人看的。
+     token 一律走这张表；没有把握的 token 宁可原样列出，也不猜错语义。 */
+  var REASON_NAME = {
+    share_better: "分享侧规格更优 → 淘汰转存",
+    local_better: "转存侧规格更优 → 淘汰分享",
+    share_wins: "分享侧逐集达标 → 整季淘汰转存",
+    local_wins: "转存侧更全/更优 → 淘汰分享",
+    residual_local: "转存侧是残次品（缺前序 / 中间断层）→ 淘汰转存",
+    residual_share: "分享侧是残次品（缺前序 / 中间断层）→ 淘汰分享",
+    multi_full_share: "多季保护：分享侧全季达标，整剧零和替代",
+    multi_protect_local: "多季保护：转存侧胜出",
+    multi_protect_partial_share: "多季保护：分享侧仅部分季胜出 → 淘汰分享",
+    special_share_better: "特别篇：分享侧更优 → 淘汰转存",
+    special_local_better: "特别篇：转存侧更优 → 淘汰分享",
+    special_delete_local: "特别篇：按策略直接删除转存侧",
+    whitelist: "命中豁免关键字 → 整部跳过",
+    decision_keep_share: "按决策模型保留分享",
+    decision_keep_local: "按决策模型保留转存"
+  };
 
   NK.esc = esc;
   function empty(iconName, title, sub) {
@@ -163,6 +182,7 @@
 
     /* 运行状态 */
     var q = ov.quality || {};
+    var rm = ov.remote || {};
     var rows = [
       ["库根", ov.root || "—"],
       ["库根可写", (ov.writable && ov.writable.ok) ? "是" : ("否（" + ((ov.writable && ov.writable.reason) || "?") + "）")],
@@ -171,6 +191,11 @@
       ["待执行计划", (ov.plans_pending || 0) + " 个（TTL " + (ov.plan_ttl_min || 0) + " 分钟）"],
       ["未知规格策略", String(q.unknown || "—")],
       ["画质优先级", Array.isArray(q.order) ? q.order.slice(0, 4).join(" > ") + " …" : "—"],
+      /* 「删除会不会连网盘真实文件一起删」必须一眼可见 */
+      ["网盘清理", rm.enabled
+        ? ("已启用" + (rm.host_prefix ? " · " + rm.host_prefix : " · 未填宿主前缀（保存会被拒）"))
+        : "未启用（只删 NAS 上的 strm）"],
+      ["空目录清理", rm.clean_empty_dirs === false ? "关闭" : "开启"],
       ["规则指纹", ov.rule_sig || "—"]
     ];
     $("#ovStatus").innerHTML = rows.map(function (r) {
@@ -437,11 +462,21 @@
           (st === "pending" ? '<span class="hint">剩余 ' + esc(NK.left(d.expires)) + "</span>" : "") +
         "</div></div>" +
       '<div class="row" style="margin-bottom:12px">' +
-        pill("待删文件", d.total_files, "brand") +
+        pill("待删 strm", d.total_files, "brand") +
         pill("涉及作品", (d.actions || []).length, "plain") +
+        (d.remote_total ? pill("网盘源文件", d.remote_total, "err") : "") +
+        (d.dirs_total ? pill("待清目录", d.dirs_total, "plain") : "") +
         pill("置信下限", strg.min_confidence || "—", "plain") +
         pill("未知规格", strg.unknown || "—", "plain") +
       "</div>";
+
+    /* 一旦计划里含网盘源文件，先把这件事说在最前面 */
+    if (d.remote_total) {
+      html += '<div class="banner err">' + icon("cloud") + " 本计划将删除 <b>" +
+        d.remote_total + " 个网盘上的真实文件</b>（含附属字幕），" +
+        "并清空 " + (d.dirs_total || 0) + " 个空目录。网盘侧删不干净的作品会保留其 strm。" +
+        "</div>";
+    }
 
     /* 策略条：双库精简的裁决口径。读不出这些值，用户就没法预判计划会删哪边。 */
     var dualActs = (d.actions || []).filter(function (a) { return a.scope === "cross"; });
@@ -449,8 +484,9 @@
       html += '<div class="strat">' +
         strat("scale", "决策模型", DEC_NAME[strg.decision] || strg.decision || "—",
               strg.decision === "quality_first" ? "" : "tone-brand") +
-        strat("shield", "平局档", TIE_NAME[strg.tie_keep] || strg.tie_keep || "skip",
-              strg.tie_keep === "skip" ? "tone-ok" : "tone-warn") +
+        strat("shield", "平局档", TIE_NAME[strg.tie_keep] || strg.tie_keep || "share",
+              strg.tie_keep === "skip" ? "tone-ok"
+                : (strg.tie_keep === "local" ? "tone-warn" : "tone-brand")) +
         strat("check", "季达标率", fmtRatio(strg.season_replace_ratio)) +
         strat("plan", "多季保护", strg.multi_season_protect === "off" ? "关闭" : "开启") +
         strat("file", "作品配对", strg.match === "tmdb_first" ? "TMDB 优先（校验年份）" : "片名 + 年份") +
@@ -462,7 +498,13 @@
       var res = d.result, tone = res.status === "done" ? "ok" : (res.status === "dry_run" ? "info" : "warn");
       html += '<div class="banner ' + tone + '">上次执行：' + esc(res.status) +
               " · 命中 " + (res.planned || 0) + " / 实删 " + (res.removed || 0) +
-              " / 跳过作品 " + ((res.skipped_titles || []).length) + "</div>";
+              " / 跳过作品 " + ((res.skipped_titles || []).length);
+      if (res.remote_planned !== undefined) {
+        html += " · 网盘 " + (res.remote_removed || 0) + "/" + (res.remote_planned || 0);
+        if (res.remote_deferred) html += "（" + res.remote_deferred + " 部因网盘未删净而保留 strm）";
+      }
+      if (res.dirs_removed) html += " · 空目录 " + res.dirs_removed;
+      html += "</div>";
     }
 
     /* 操作条 */
@@ -550,7 +592,7 @@
     var keepLine = a.keep_summary ? '<div class="reason">择优依据：' + esc(a.keep_summary) + "</div>" : "";
     var scopeLine = a.scope === "cross" ? '<span class="pill brand">双库精简</span>' : "";
     var sideLine = a.side === "shr" ? "淘汰分享库" : (a.side === "loc" ? "淘汰转存库" : "");
-    var reasonLine = a.reason_label ? '<div class="reason">' + esc(a.reason_label) + "</div>" : "";
+    var reasonLine = reasonText(a);
     var subs = a.subs || [];
     var subsLine = subs.length
       ? '<div class="reason">随删同名字幕 ' + subs.length + " 个：" +
@@ -573,10 +615,61 @@
           "<ul>" + drops.map(function (x) {
             return "<li>" + esc(x.name) + (x.summary ? "<br><span class='dim'>" + esc(x.summary) + "</span>" : "") + "</li>";
           }).join("") + "</ul></div>" +
+        remoteBox(a) + dirsBox(a) +
       "</div>" +
-      compareBlock(a.compare) + subsLine +
-      reasonLine + (a.reason ? '<div class="reason">' + esc(a.reason) + "</div>" : "") +
-      "</div>";
+      compareBlock(a.compare) + subsLine + reasonLine + "</div>";
+  }
+
+  /* 「为什么这么裁决」只讲一句人话：
+     reason_label（后端给的中文）> 前端 token 表 > 原样列出 token（不猜）。 */
+  function reasonText(a) {
+    var label = a.reason_label || "";
+    var raw = String(a.reason || "");
+    if (!raw) return label ? '<div class="reason">' + esc(label) + "</div>" : "";
+    if (!/^[a-z0-9_]+$/.test(raw)) {
+      return (label ? '<div class="reason">' + esc(label) + "</div>" : "") +
+             '<div class="reason">' + esc(raw) + "</div>";
+    }
+    var txt = label || REASON_NAME[raw] || "";
+    if (txt) return '<div class="reason">' + esc(txt) + "</div>";
+    return '<div class="reason">裁决：<code>' + esc(raw) + "</code></div>";
+  }
+
+  /* 路径列表：把目录部分压暗、只把文件名/目录名高亮，长路径也一眼能读 */
+  function pathLi(p) {
+    p = String(p || "");
+    var i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+    var head = i >= 0 ? p.slice(0, i + 1) : "";
+    var tail = i >= 0 ? p.slice(i + 1) : p;
+    return "<li>" + (head ? '<span class="head">' + esc(head) + "</span>" : "") +
+           '<span class="tail">' + esc(tail) + "</span></li>";
+  }
+
+  /* 网盘侧待删：这是「真删了网盘上的文件」，必须比 strm 更醒目 */
+  function remoteBox(a) {
+    var remote = a.remote || [];
+    if (!remote.length) return "";
+    return '<div class="side-box wide remote"><div class="lbl">' + icon("cloud") +
+      "网盘源文件一起删 " + remote.length + " 个（不可逆）</div>" +
+      '<ul class="path-list">' + remote.map(pathLi).join("") + "</ul></div>";
+  }
+
+  /* 待清空的空目录：分网盘侧与 NAS 侧两块列出 */
+  function dirsBox(a) {
+    var rd = a.remote_rmdirs || [], nd = a.rmdirs || [];
+    if (!rd.length && !nd.length) return "";
+    var out = '<div class="side-box wide dirs"><div class="lbl">' + icon("folder") +
+      "删完顺带清空的目录 " + (rd.length + nd.length) + " 个</div>" +
+      '<ul class="path-list">';
+    if (rd.length) {
+      out += '<li><span class="head">网盘侧 · </span>' + rd.length + " 个</li>" +
+             rd.map(pathLi).join("");
+    }
+    if (nd.length) {
+      out += '<li><span class="head">NAS 侧 · </span>' + nd.length + " 个</li>" +
+             nd.map(pathLi).join("");
+    }
+    return out + "</ul></div>";
   }
 
   function bindPlanOps() {
@@ -686,26 +779,35 @@
   function openDeleteModal(d) {
     var phrase = d.confirm_phrase || "删除这些 strm 文件";
     var drops = d.total_files || 0;
+    var remote = d.remote_total || 0;
+    var dirs = d.dirs_total || 0;
     var rev = d._review;
     var mask = NK.modal({
       title: "执行删除（不可撤销）",
       wide: true,
       body:
         '<div class="banner err" style="margin-top:0"><b>这是真实删除。</b>' +
-          "通过 115 删源文件不会被本工具同步；被删除的 strm 无法从本工具恢复，" +
-          "Emby 侧对应条目会随之失效。请先确认保留版本正确。</div>" +
+          (remote ? "命中作品会<b>先删网盘上的源文件</b>（115 侧进回收站，需自行清理才释放空间），" +
+                    "成功后才删对应的 strm；网盘侧删不干净的作品会保留 strm。" : "") +
+          "被删除的 strm 无法从本工具恢复，Emby 侧对应条目会随之失效。" +
+          "请先确认保留版本正确。</div>" +
         '<div class="kv" style="margin:6px 0 12px">' +
-          kv("计划", d.id) + kv("将删除", drops + " 个 strm 文件 / " + (d.actions || []).length + " 部作品") +
+          kv("计划", d.id) +
+          kv("NAS 侧", drops + " 个文件（strm 及同名字幕）/ " + (d.actions || []).length + " 部作品") +
+          (remote ? kv("网盘侧", remote + " 个源文件与附属字幕") : kv("网盘侧", "本次不涉及（未启用网盘清理）")) +
+          (dirs ? kv("空目录", "删完清空 " + dirs + " 个（分类目录不动）") : "") +
           kv("保留", "每部作品的择优版本（其余删除）") +
         "</div>" +
         '<div id="delReview">' + (rev && rev.executable === true
           ? '<div class="banner ok">' + icon("check") + " 已通过执行前复核（" + rev.total_files +
-            " 个文件指纹一致）</div>"
+            " 个文件指纹一致" +
+            (rev.remote_files ? "，含 " + rev.remote_files + " 个网盘源文件" : "") + "）</div>"
           : '<div class="banner warn">还没有通过执行前复核。请先点「开始复核」，' +
             "确认文件与计划一致后才能删除。</div>") + "</div>" +
         '<label class="gate" style="cursor:pointer">' +
           '<input type="checkbox" id="delAck">' +
-          "<div><b>我已确认保留版本正确</b><small>并理解删除不可撤销</small></div></label>" +
+          "<div><b>我已确认保留版本正确</b><small>并理解删除不可撤销" +
+            (remote ? "、且会一并删除网盘上的源文件" : "") + "</small></div></label>" +
         '<div class="gate" style="flex-direction:column;align-items:stretch;gap:6px">' +
           '<div class="row"><span class="n">2</span><b>输入确认短语</b></div>' +
           '<div class="hint">需精确输入：<span class="confirm-phrase">' + esc(phrase) + "</span></div>" +
@@ -721,7 +823,9 @@
               if (r && r.executable === true) {
                 rev = r;
                 slot.innerHTML = '<div class="banner ok">' + icon("check") + " 已通过执行前复核（" +
-                                 r.total_files + " 个文件指纹一致 / " + r.titles + " 部作品）</div>";
+                                 r.total_files + " 个文件指纹一致" +
+                                 (r.remote_files ? "，含 " + r.remote_files + " 个网盘源文件" : "") +
+                                 " / " + r.titles + " 部作品）</div>";
               } else if (r) {
                 rev = null;
                 slot.innerHTML = '<div class="banner err">复核未通过：指纹不一致 ' +

@@ -3,9 +3,14 @@ services:
     # 直接拉取 CI 构建好的镜像（amd64 + arm64），不在本机构建。
     # 锁到具体版本便于复现；想跟随主线改回 :latest（`docker compose pull` 即升级）。
     # 若包不是 Public，先 docker login ghcr.io -u <用户名> -p <PAT>（PAT 需 read:packages）。
-    image: ghcr.io/utterliar1/nankeep:0.3.0
+    image: ghcr.io/utterliar1/nankeep:0.4.0
     container_name: nankeep
     restart: unless-stopped
+
+    # CD2 / OpenList 等 FUSE 挂载点上的文件是 root:root + default_permissions，
+    # uid 1000 写不了 —— 要删网盘源文件就必须以 root 跑。
+    # 不启用 remote（不删网盘文件）时可改成 "1000:1000"（/data 已 chown 1000）。
+    user: "0:0"
 
     ports:
       # 暴露到 NAS 局域网，供 iKuai 上的 Lucky 反向代理（跨主机）
@@ -43,15 +48,27 @@ services:
       #    左侧改成你的真实路径，右侧保持 /library
       - /path/to/nanshare:/library
 
-      # ② 状态目录：SQLite（计划 + 审计）、索引缓存、互斥锁
-      #    安装后需 chown 到 1000:1000，见 README
+      # ② 网盘挂载点（**只在你启用 remote 段时才需要**）。
+      #    转存已整理里的 strm 内容是网盘挂载点上的宿主路径，nankeep 把它映射成
+      #    容器内路径后直接 unlink —— 也就是真删网盘上的源文件（115 会同步删 strm）。
+      #
+      #    `rslave` 不能省：CD2 的 CloudDrive 是嵌套在 CloudNAS 下的子挂载，
+      #    不带传播标志就看不见它，容器里会是空目录。
+      #    左侧填**挂载点根**（下面 config.json 的 host_prefix 要指向它里面的子目录）：
+      - /path/to/emby/strm/CloudNAS:/cloud:rslave
+
+      # ③ 状态目录：SQLite（计划 + 审计）、索引缓存、互斥锁、界面改的设置覆盖文件
+      #    安装后需 chown 到 1000:1000（root 模式也能用），见 README
       - ./data:/data
 
-      # ③ 配置文件（只读）。改画质档位/策略（decision、tie_keep、达标率…）后
-      #    重启容器即生效；rule_sig 会随之变化，旧计划自动作废，不会拿新规则删旧结论。
+      # ④ 配置文件（只读）。改画质档位/策略（decision、tie_keep、达标率、remote…）
+      #    后重启容器即生效；rule_sig 会随之变化，旧计划自动作废，不会拿新规则删旧结论。
       #    容器内已有同路径的默认配置，挂载会覆盖它 —— 先把仓库里的 nankeep.config.json
       #    复制到 compose 同目录再改：
       #      cp nankeep.config.json ./config.json
+      #
+      #    想让界面直接改设置（无需 docker cp / 重启）就走 /data/settings.json 覆盖层：
+      #    它由 Web 层的设置页写入，优先级高于本文件。两者都会让旧计划作废。
       - ./config.json:/app/nankeep.config.json:ro
 
     logging:
