@@ -19,10 +19,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # 本项目 stdlib only：没有 requirements.txt，也没有 pip install 步骤
-COPY nankeep.py nankeep_web.py nankeep.config.json ./
-COPY static/ ./static/
+# --chown + chmod：COPY 会保留「构建宿主的文件模式」（受宿主 umask 影响，可能是 0600），
+# 而运行用户是 uid 1000 —— 不显式放开就会 `Permission denied` 读不到 .py。
+COPY --chown=1000:1000 nankeep.py nankeep_web.py nankeep.config.json ./
+COPY --chown=1000:1000 static/ ./static/
 
-RUN mkdir -p /data/out && chown -R 1000:1000 /data
+RUN chmod -R a+rX /app \
+    && mkdir -p /data/out && chown -R 1000:1000 /data
 
 # 非 root 运行。实测（2026-10-14，NAS 上 docker run 验证）：
 # uid 1000 在容器内即可对库目录 touch/cp/rm——包括 root:root 700 属主的目录，
