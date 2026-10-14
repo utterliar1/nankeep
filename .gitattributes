@@ -1,0 +1,8 @@
+# 统一按 LF 入库：本工具在 NAS(Linux) 上执行生成的 bash 脚本，CRLF 会污染脚本。
+* text=auto eol=lf
+
+# 二进制类型不做换行转换
+*.gz  binary
+*.zip binary
+*.png binary
+*.jpg binary

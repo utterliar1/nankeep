@@ -1,0 +1,25 @@
+# ---- 运行产物：库索引 / 报告 / 计划 / 执行脚本 ----
+# 体积大（analysis.json ~10MB、library.json.gz ~2.7MB），且内容含库内片名，不入库。
+out/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---- 本地虚拟环境 ----
+.venv/
+venv/
+env/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- 敏感：本仓库当前无凭据，防误入 ----
+.env
+*.key
+*.pem

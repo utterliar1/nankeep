@@ -1,0 +1,31 @@
+{
+  "share_root": "//YOUR-NAS/emby/strm/nanshare",
+  "out_dir": "out",
+  "quality": {
+    "unknown": "skip",
+    "order": ["resolution", "dolby", "source", "vcodec", "bitdepth", "fps", "audio", "channels", "release_group"],
+    "enabled": {
+      "release_group": false,
+      "source": true,
+      "resolution": true,
+      "dolby": true,
+      "vcodec": true,
+      "bitdepth": true,
+      "fps": true,
+      "audio": true,
+      "channels": true
+    },
+    "tiers": {
+      "source": ["UHD Remux", "Remux", "UHD BluRay", "BluRay", "WEB-DL", "WEBRip", "HDTV", "DVD", "未识别"],
+      "resolution": ["8K", "4K", "2K", "1080p", "720p", "SD", "未识别"],
+      "dolby": ["DV P7", "DV P5", "DV P8", "DV", "HDR10+", "HDR Vivid", "HDR10", "HDR", "SDR", "未识别"],
+      "vcodec": ["AV1", "HEVC", "H.264", "VC-1", "MPEG-2", "未识别"],
+      "bitdepth": ["12bit", "10bit", "8bit", "未识别"],
+      "fps": ["60", "50", "30", "25", "24", "未识别"],
+      "audio": ["TrueHD Atmos/DTS:X", "TrueHD/DTS-HD MA", "LPCM/FLAC", "DD+ Atmos", "DD+/EAC3", "DTS", "AC3", "AAC", "未识别"],
+      "channels": ["7.1", "5.1", "2.0", "1.0", "未识别"],
+      "release_group": []
+    },
+    "release_groups": []
+  }
+}
