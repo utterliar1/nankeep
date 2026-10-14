@@ -3,7 +3,7 @@
 """
 nankeep —— NanShare strm 库治理工具（只读优先）
 
-针对 \\\\<你的NAS>\\emby\\strm\\nanshare 的「分享已整理 / 转存已整理」双库：
+针对 NanShare 输出的 `<库根>/分享已整理` 与 `<库根>/转存已整理` 双库：
 
     scan    扫描两库，解析片名/年份/tmdbid/季集/规格，落结构化索引
     report  生成治理报告（多版本择优、逐集混版本、缺集、命名异常、孤立字幕、跨库对照）
@@ -39,6 +39,8 @@ from collections import defaultdict
 
 # ─────────────────────────── 常量 ───────────────────────────
 
+# 默认库根只是占位示例 —— 实际用 --root、环境变量 NANKEEP_ROOT 或配置文件覆盖。
+# 别把它改成真实地址后提交：这个文件会随镜像一起公开。
 DEFAULT_SHARE_ROOT = "//YOUR-NAS/emby/strm/nanshare"
 LIB_SHARE = "分享已整理"
 LIB_TRANSCODE = "转存已整理"

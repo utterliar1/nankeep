@@ -1,6 +1,6 @@
 # nankeep —— NanShare strm 库治理工具
 
-针对 `\\<你的NAS>\emby\strm\nanshare` 的「分享已整理 / 转存已整理」双库做**只读优先**的治理：
+针对 NanShare 输出的 `\\<你的NAS>\emby\strm\nanshare` 的「分享已整理 / 转存已整理」双库做**只读优先**的治理：
 
 ```
 扫描 → 规格解析 → 多版本择优 / 逐集混版本 / 缺集 / 命名异常 / 孤立字幕 / 跨库对照
@@ -50,7 +50,7 @@ CLI 只能在工作机的终端里跑。Web 层把同一套治理逻辑（**完�
 
 ```
 容器 nankeep（python:3.12-slim, uid 1000）
-   ├─ /library  ←  /path/to/nanshare      （读写：删除需要写权限）
+   ├─ /library  ←  /path/to/nanshare                  （读写：删除需要写权限；改成你的真实路径）
    └─ /data     ←  ./data                              （SQLite 计划+审计 / 索引缓存 / 互斥锁）
         │
         └── :8322 ──→ iKuai 上的 Lucky 反代 ──→ https://<你的域名>
@@ -97,7 +97,7 @@ curl -s localhost:8322/api/health                   # {"ok":true,...}
 
 | 项 | 值 |
 | --- | --- |
-| 前端域名 | `nankeep.你的域名`（`*.<你的域名>` 泛解析指向你的公网 IP） |
+| 前端域名 | `nankeep.你的域名`（把 `*.你的域名` 泛解析指到公网入口） |
 | 后端地址 | `http://<NAS 的局域网 IP>:8322` |
 | 协议 | HTTPS（Lucky 自动签证书） |
 

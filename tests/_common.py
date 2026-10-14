@@ -11,6 +11,7 @@ ROOT_DIR = os.path.dirname(HERE)
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
+# 假 strm 内容：形如 NanShare 写出的 sha1 直链，但主机与 ID 全是占位值
 SRM_URL = ("http://127.0.0.1:1/api/share115/SC/0123456789ABCDEF0123456789ABCDEF01234567"
            "/RC/abc123/1234567890123456789")
 
