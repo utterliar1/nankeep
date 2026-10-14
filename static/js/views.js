@@ -195,6 +195,9 @@
       ["网盘清理", rm.enabled
         ? ("已启用" + (rm.host_prefix ? " · " + rm.host_prefix : " · 未填宿主前缀（保存会被拒）"))
         : "未启用（只删 NAS 上的 strm）"],
+      ["网盘挂载点", rm.enabled
+        ? ((rm.container_prefix || "未填") + (rm.mounted ? " · 已挂载" : " · 容器内不可见！"))
+        : "—"],
       ["空目录清理", rm.clean_empty_dirs === false ? "关闭" : "开启"],
       ["规则指纹", ov.rule_sig || "—"]
     ];

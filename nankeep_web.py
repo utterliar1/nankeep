@@ -1180,6 +1180,9 @@ def r_overview(h, q):
         "remote": {
             "enabled": bool((cfg.get("remote") or {}).get("enabled")),
             "host_prefix": (cfg.get("remote") or {}).get("host_prefix") or "",
+            # container_prefix 决定映射落点，是判断「配对了没」的关键，必须一起下发
+            "container_prefix": (cfg.get("remote") or {}).get("container_prefix") or "",
+            "mounted": nk._mount_ok((cfg.get("remote") or {}).get("container_prefix") or ""),
             "delete_source": bool((cfg.get("remote") or {}).get("delete_source")),
             "delete_sidecars": bool((cfg.get("remote") or {}).get("delete_sidecars")),
             "clean_empty_dirs": bool((cfg.get("remote") or {}).get("clean_empty_dirs")),

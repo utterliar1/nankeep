@@ -606,6 +606,35 @@ class TestWorkDir(unittest.TestCase):
                          "/lib/电影/其他电影/Season 的故事 (2020)")
 
 
+class TestMountOk(unittest.TestCase):
+    """网盘挂载点探测必须是**只读**的：前缀写错时不能把错误粉饰成「目录存在」。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nankeep-mnt-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_existing_dir_is_ok(self):
+        self.assertTrue(nk._mount_ok(self.tmp))
+
+    def test_empty_and_missing_are_not_ok(self):
+        self.assertFalse(nk._mount_ok(""))
+        self.assertFalse(nk._mount_ok(os.path.join(self.tmp, "nope")))
+
+    def test_never_creates_the_probed_path(self):
+        """这是关键：探测不能有副作用，否则 host_prefix 写错时会凭空造目录。"""
+        missing = os.path.join(self.tmp, "no-such-mount")
+        self.assertFalse(nk._mount_ok(missing))
+        self.assertFalse(os.path.exists(missing))
+
+    def test_file_is_not_a_mount(self):
+        f = os.path.join(self.tmp, "a.txt")
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        self.assertFalse(nk._mount_ok(f))
+
+
 class TestDirsEmptiedBy(unittest.TestCase):
     """删除后变空的目录预测：从深到浅排序，且绝不越过作品目录。"""
 

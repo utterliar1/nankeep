@@ -1456,6 +1456,22 @@ def _work_dir(path: str) -> str:
     return d
 
 
+def _mount_ok(p: str) -> bool:
+    """挂载点是否真的可见（**只读探测**：绝不 makedirs、绝不写探针）。
+
+    网盘挂载点（CD2/OpenList 的 FUSE）不能像普通目录那样「写一下试试」：
+      ① 往网络 FUSE 上写试探文件会打扰远端；
+      ② 更糟的是 `makedirs` —— 前缀写错时它会在宿主上凭空建出一个同名目录，
+         把「配错了」粉饰成「看起来存在」，比不检查还危险。
+    """
+    if not p:
+        return False
+    try:
+        return os.path.isdir(p) and os.access(p, os.R_OK)
+    except OSError:
+        return False
+
+
 def _only_victims(d: str, victims: set, gone=()) -> bool:
     """目录 d 下除 victims（及已判定会被删掉的 gone 目录）外是否已无其它条目。"""
     try:

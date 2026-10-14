@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tests import _common                                   # noqa: E402
+import nankeep as nk                                        # noqa: E402
 
 PASSWORD = "test-password-12345"
 RESULT = {"pass": [], "fail": []}
@@ -337,6 +338,14 @@ def main():
               str(ov.get("remote")))
         check("总览不泄露网盘指纹",
               "remote_guard" not in json.dumps(ov) and "mtime_ns" not in json.dumps(ov))
+        check("总览下发映射落点与挂载可见性",
+              bool((ov.get("remote") or {}).get("container_prefix"))
+              and (ov.get("remote") or {}).get("mounted") is True,
+              str(ov.get("remote")))
+        # 只读探测：挂载点检查绝不能凭空创建目录（前缀写错时会把错误粉饰成「存在」）
+        wrong = os.path.join(env_paths["base"], "no-such-mount")
+        check("挂载探测不会创建目录",
+              nk._mount_ok(wrong) is False and not os.path.exists(wrong))
 
         print("\n== 11. 静态资源 ==")
         for path, needle in (("/static/index.html", "nankeep"),
