@@ -71,7 +71,7 @@ mkdir -p data && sudo chown -R 1000:1000 data      # 兜底：改回 uid 1000 �
 docker compose pull                                 # 拉取 ghcr.io/utterliar1/nankeep:<版本>
 docker compose up -d
 docker compose logs -f                              # 看到 "web 已启动" 即成功
-curl -s localhost:8322/api/health                   # {"ok":true,"version":"0.4.0",...}
+curl -s localhost:8322/api/health                   # {"ok":true,"version":"0.4.1",...}
 ```
 
 改 `config.json`（比如把 `strategy.tie_keep` 从 `share` 改成 `skip`）后 `docker compose restart`
@@ -82,7 +82,7 @@ curl -s localhost:8322/api/health                   # {"ok":true,"version":"0.4.
 
 **镜像**：`ghcr.io/utterliar1/nankeep:latest`。
 推 `v*` tag 会触发 CI 先跑测试、再构建 amd64+arm64 双架构并推送，所以 NAS 架构通常直接可用
-（`docker compose pull && docker compose up -d` 即升级）。用 `:0.4.0` 这样**不带 `v`** 的版本号锁版本，
+（`docker compose pull && docker compose up -d` 即升级）。用 `:0.4.1` 这样**不带 `v`** 的版本号锁版本，
 `:latest` 跟随主线。
 
 > **包可见性**：默认是 Private，匿名 `docker pull` 会报 `denied`。本仓库代码本就公开，
@@ -93,8 +93,8 @@ curl -s localhost:8322/api/health                   # {"ok":true,"version":"0.4.
 ### 发布与升级
 
 ```
-改代码 → git commit → git tag v0.4.0 && git push origin v0.4.0
-        └─ CI：测试 → 构建 amd64+arm64 → 推 ghcr（tag 0.4.0 + latest）
+改代码 → git commit → git tag v0.4.1 && git push origin v0.4.1
+        └─ CI：测试 → 构建 amd64+arm64 → 推 ghcr（tag 0.4.1 + latest）
 NAS：  改 compose 里的 image 版本 → docker compose pull && docker compose up -d
 ```
 
@@ -150,7 +150,10 @@ NAS：  改 compose 里的 image 版本 → docker compose pull && docker compos
 | **日志** | 服务端运行日志尾部（可过滤、自动滚动开关、失败行高亮） | 不会 |
 
 顶栏的运行状态浮层聚合了服务连接、库根可写性、索引/报告新鲜度、待执行计划数、
-当前任务与版本号；`GET /api/overview` 一次返回这些数据，前端只轮询这一个接口。
+当前任务与版本号，以及**网盘清理是否真的能生效** —— 除「网盘清理（宿主前缀）」外还单列
+「网盘挂载点」，显示 `container_prefix` 及容器内是否可见；映射三件套
+（`host_prefix` → `container_prefix` → 容器内可见）任一不成立都会在这里显形，
+不必等生成计划才发现配错。`GET /api/overview` 一次返回这些数据，前端只轮询这一个接口。
 
 ## 命令
 

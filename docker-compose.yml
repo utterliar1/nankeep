@@ -3,7 +3,7 @@ services:
     # 直接拉取 CI 构建好的镜像（amd64 + arm64），不在本机构建。
     # 锁到具体版本便于复现；想跟随主线改回 :latest（`docker compose pull` 即升级）。
     # 若包不是 Public，先 docker login ghcr.io -u <用户名> -p <PAT>（PAT 需 read:packages）。
-    image: ghcr.io/utterliar1/nankeep:0.4.0
+    image: ghcr.io/utterliar1/nankeep:0.4.1
     container_name: nankeep
     restart: unless-stopped
 
