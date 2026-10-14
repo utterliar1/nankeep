@@ -1236,6 +1236,9 @@ def r_plan_detail(h, q, pid):
         "remote": a.get("remote") or [],
         "rmdirs": a.get("rmdirs") or [],
         "remote_rmdirs": a.get("remote_rmdirs") or [],
+        # 网盘源文件定位失败（host_prefix 写错）：计划整体不可执行，前端要显式说明，
+        # 否则用户只会看到「复核不通过」却不知道为什么。
+        "remote_problem": a.get("remote_problem"),
         "confidence": a.get("confidence"), "decided_by": a.get("decided_by"),
         "reason": a.get("reason"),
         "reason_label": a.get("reason_label") or "",
@@ -1248,6 +1251,7 @@ def r_plan_detail(h, q, pid):
              "confirm_phrase": CONFIRM_PHRASE,
              "total_files": sum(len(a["files"]) for a in actions),
              "remote_total": sum(len(a["remote"]) for a in actions),
+             "remote_problems": sum(1 for a in actions if a["remote_problem"]),
              "dirs_total": sum(len(a["rmdirs"]) + len(a["remote_rmdirs"])
                                for a in actions),
              "actions": actions})

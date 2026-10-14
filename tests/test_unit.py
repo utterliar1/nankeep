@@ -752,6 +752,51 @@ class TestRemotePlanAnnotation(_DualFixture):
         self.assertIsNone(nk._remote_fingerprint(os.path.join(self.mnt, self.REL)))
         self.assertIsNone(nk._remote_fingerprint(os.path.join(self.mnt, "nope.mkv")))
 
+    # ── 闸门：remote 开着却定位不到网盘源文件 → 整份计划不可执行 ──
+    # 不做这一步就会「strm 删了、网盘文件还在占空间」，正是这个功能要消灭的东西。
+
+    def test_wrong_host_prefix_blocks_plan(self):
+        plan = self._plan(host_prefix="/vol1/1000/emby/strm/CloudNAS/CloudDriveX")
+        act = self._act(plan)
+        self.assertEqual(act["remote"], [], "定位失败就不该产生任何网盘删除项")
+        self.assertIsNotNone(act["remote_problem"])
+        self.assertIn("不匹配", act["remote_problem"]["reason"])
+        bad = nk.validate_plan(plan)
+        self.assertTrue(any("网盘源文件" in b["reason"] for b in bad), str(bad))
+
+    def test_missing_host_prefix_blocks_plan(self):
+        act = self._act(self._plan(host_prefix=""))
+        self.assertIsNotNone(act["remote_problem"])
+        self.assertIn("未配置", act["remote_problem"]["reason"])
+
+    def test_url_side_strm_is_not_a_problem(self):
+        """淘汰分享侧时文件都是 302 直链 —— 本来就没有网盘源文件，不该被闸门拦下。"""
+        cfg = self._cfg()
+        cfg["strategy"] = dict(cfg["strategy"], decision="keep_local")
+        plan = nk.build_plan(nk.analyze_all(self.scans, cfg), nk.KIND_MOVIE, cfg)
+        act = next(a for a in plan["actions"] if "网盘甲" in a["name"])
+        self.assertIn(nk.LIB_SHARE, act["files"][0])
+        self.assertIsNone(act["remote_problem"])
+        self.assertEqual(nk.validate_plan(plan), [])
+
+    def test_remote_state_classification(self):
+        def mk(name, content):
+            p = os.path.join(self.root, name)
+            _common.write_strm(p, content)
+            return p
+
+        self.assertEqual(nk._remote_state(mk("s1.strm", self.host + "/x.mkv"),
+                                          self._cfg()), "mapped")
+        self.assertEqual(nk._remote_state(mk("s2.strm", "/mnt/other/x.mkv"),
+                                          self._cfg()), "unmapped")
+        self.assertEqual(nk._remote_state(mk("s3.strm", _common.SRM_URL),
+                                          self._cfg()), "url")
+        self.assertEqual(nk._remote_state(mk("s4.strm", self.host + "/x.mkv"),
+                                          {"remote": {"enabled": True}}), "no-host")
+        # 反向路径：unmapped 判定必须靠前缀边界，不能把「别的 CloudDrive2」当自家人
+        self.assertEqual(nk._remote_state(mk("s5.strm", self.host + "2/x.mkv"),
+                                          self._cfg()), "unmapped")
+
     def test_emit_sh_covers_remote_files_and_dirs(self):
         """CLI 导出的脚本必须和 Web 层同语义：网盘源文件 + 空目录都要在里面。"""
         sh = nk.emit_sh(self._plan(), ENV["lib"])

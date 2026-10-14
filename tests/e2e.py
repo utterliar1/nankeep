@@ -218,6 +218,12 @@ def main():
                   str(d.get("remote_total")))
             check("计划详情汇总待清目录数", d.get("dirs_total") == 3,
                   str(d.get("dirs_total")))
+            s, shb = call(op, port, f"/api/plan/{pid}/script", raw=True)
+            sh = shb.decode("utf-8", "replace") if isinstance(shb, bytes) else str(shb)
+            check("导出脚本含网盘源文件", s == 200 and _common.CLOUD_MKV in sh,
+                  f"got {s} {sh[:120]}")
+            check("导出脚本含网盘删不净则跳过", "rmfail" in sh and "网盘未删净" in sh)
+            check("导出脚本默认 dry-run", "\nDRY=1\n" in sh)
         else:
             for n in ("网盘源文件进计划", "网盘侧待清空目录", "NAS 侧作品目录待清空"):
                 check(n, False, "未找到网盘乙动作")
@@ -435,6 +441,39 @@ def main():
         s, _ = call(op, port, "/api/settings", "POST",
                     {"settings": {"strategy": {"tie_keep": "local"}}})
         check("设置写请求需同源", s == 403, f"got {s}")
+
+        print("\n== 12c. 网盘归属闸门（host_prefix 写错 → 整份计划不可执行） ==")
+        # 真删那一步已经把网盘那对清掉了，这里重建一对再故意写错前缀。
+        _common.add_cloud_pair(lib, env_paths["base"])
+        s, _ = call(op, port, "/api/settings", "POST",
+                    {"settings": {"remote": {"host_prefix": "/vol1/nope"}}},
+                    headers={"Origin": origin})
+        check("写入错误的 host_prefix", s == 200, f"got {s}")
+        s, r = call(op, port, "/api/task/plan", "POST",
+                    {"kind": "movie", "min_confidence": "weak", "use_cache": False},
+                    headers={"Origin": origin})
+        t3 = wait_task(op, port, r["task_id"])
+        pid3 = (t3.get("result") or {}).get("plan_id")
+        check("重建后计划已生成", bool(pid3), str(t3.get("result")))
+        d3 = call(op, port, f"/api/plan/{pid3}")[1]
+        check("计划被标记网盘定位失败", (d3.get("remote_problems") or 0) >= 1,
+              str(d3.get("remote_problems")))
+        check("定位失败就不产生网盘删除项", d3.get("remote_total") == 0,
+              str(d3.get("remote_total")))
+        prob = next((a["remote_problem"] for a in d3.get("actions", [])
+                     if a.get("remote_problem")), None)
+        check("原因指明前缀不匹配", bool(prob) and "不匹配" in prob["reason"], str(prob))
+        s, pv4 = call(op, port, f"/api/plan/{pid3}/preview", "POST", {},
+                      headers={"Origin": origin})
+        check("复核判定不可执行", pv4.get("executable") is False, str(pv4.get("message")))
+        reasons = " ".join(b.get("reason") or "" for b in (pv4.get("mismatch") or []))
+        check("不一致清单给出网盘原因", "网盘源文件" in reasons, reasons[:200])
+        check("计划可读但不可执行（未静默清空 files）",
+              (d3.get("total_files") or 0) > 0, str(d3.get("total_files")))
+
+        s, rs = call(op, port, "/api/settings", "POST", {"reset": True},
+                     headers={"Origin": origin})
+        check("复位设置", s == 200 and rs.get("reset") is True, f"got {s}")
 
         print("\n== 13. 登出 ==")
         call(op, port, "/api/logout", "POST")

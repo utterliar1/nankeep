@@ -143,7 +143,7 @@ NAS：  改 compose 里的 image 版本 → docker compose pull && docker compos
 | --- | --- | --- |
 | **总览** | 两库规模 KPI、按库×区的分类分布条、精简待办计数（点进报告对应章节）、最近精简时间线、计划与运行状态 | 不会 |
 | **报告** | `report.md` 渲染成带章节导航的页面（吸顶目录 + 滚动高亮），支持复制/下载 Markdown | 不会 |
-| **清理计划** | 计划列表 + **保留版 / 待删版并排对照**（规格摘要、版本数、置信度、择依据）；「执行前复核」逐文件重算指纹并列出不一致项 | 不会 |
+| **清理计划** | 计划列表 + **保留版 / 待删版并排对照**（规格摘要、版本数、置信度、择依据）；网盘源文件与待清空目录单列一栏；网盘定位失败会显式标红并说明原因；「执行前复核」逐文件重算指纹并列出不一致项 | 不会 |
 | **清理计划** | **「执行删除」**：必须①复核返回 `executable` ②勾选确认 ③精确输入确认短语，三个条件同时满足按钮才可点 | **会** |
 | **设置** | 九维档位/顺序/开关、精简策略（决策、平局档、配对、达标率、静默期、豁免词）、网盘清理段 —— 全部可视化编辑，带「界面 / 配置」来源标注与前后端同口径校验 | 不会（只写 `settings.json`） |
 | **审计** | 每次生成计划/执行清理的留痕（可按类型或失败筛选，点开看结构化 extra） | 不会 |
@@ -284,10 +284,10 @@ python nankeep.py plan --kind movie --min-confidence high   # 只出最有把握
 
 ```
 strm 内容  /vol1/1000/emby/strm/CloudNAS/CloudDrive/电影/…/xxx.mkv
-                 └────────── host_prefix ──────────┘└─ 相对路径 ─┘
+                 └─────── host_prefix ──────────┘└─ 相对路径 ─┘
                         ↕  前缀替换
-容器内     /cloud/电影/…/xxx.mkv
-           └─ container_prefix ─┘
+容器内     /cloud/CloudDrive/电影/…/xxx.mkv
+                    └─ container_prefix ─┘
 ```
 
 配置在 `config.json` 的 `remote` 段：
@@ -295,7 +295,7 @@ strm 内容  /vol1/1000/emby/strm/CloudNAS/CloudDrive/电影/…/xxx.mkv
 ```json
 "remote": {
   "enabled": false,
-  "host_prefix": "/vol1/1000/emby/strm/CloudNAS/CloudDrive",
+  "host_prefix": "/vol1/1000/emby/strm/CloudNAS",
   "container_prefix": "/cloud",
   "delete_source": true,
   "delete_sidecars": true,
@@ -306,8 +306,8 @@ strm 内容  /vol1/1000/emby/strm/CloudNAS/CloudDrive/电影/…/xxx.mkv
 | 键 | 说明 |
 | --- | --- |
 | `enabled` | 总开关。`false` 时计划里不出现任何网盘动作，只删 strm |
-| `host_prefix` | strm 里那条宿主路径的前缀。**必须写全**（含 `CloudDrive` 那一层），否则映射失败该片直接跳过 |
-| `container_prefix` | 上面挂在容器里的路径，与 compose 的 `/cloud` 对应 |
+| `host_prefix` | strm 里那条宿主路径的前缀。**照抄 compose 里 volume 的左侧、一字不差**，否则映射失败该片直接跳过 |
+| `container_prefix` | 上面挂在容器里的路径，与 compose 的 volume 右侧对应 |
 | `delete_source` | 删掉 strm 指向的网盘真实文件（mkv/mp4 等） |
 | `delete_sidecars` | 连带删掉**同目录**下同名的附属文件（`.nfo` 海报、外挂字幕、`.ass` 等） |
 | `clean_empty_dirs` | 删完文件后，把**因这次删除而变空**的目录逐层删掉 |
@@ -321,6 +321,13 @@ strm 内容  /vol1/1000/emby/strm/CloudNAS/CloudDrive/电影/…/xxx.mkv
 - **网盘侧先删、NAS 侧后删**：网盘文件删失败（不可读、已被别人删掉、FUSE 报错）时，
   **该作品的 strm 一律保留** —— 宁可留下一个指向死链的 strm 让人看见，也绝不留下
   「strm 没了但网盘文件还在悄悄占空间」这种查不出来的浪费。
+- **网盘源文件定位失败 → 整份计划作废**（不是静默跳过）。`remote.enabled` 为真时，
+  若某个转存侧 strm 是挂载点路径却匹配不上 `host_prefix`（多半是前缀写错了），
+  或压根没配 `host_prefix`，该动作会被标成 `remote_problem`，
+  `validate_plan` 直接在复核里给出原因、`executable` 变 `false`，删除按钮点不动。
+  理由：这种情况下删 strm 省不下任何空间，还会让片子在 Emby 里凭空消失 ——
+  与其让用户对着「复核不通过」猜，不如明说。
+  （分享侧的 302 直链 strm 不参与这条判定：它本来就没有网盘源文件可删。）
 - 与 strm 同名的**字幕跟删**（这条是既有行为，与 remote 无关）：删 strm 时会一并删掉
   **去语言码后同基名**的字幕；与「保留版」共享的字幕不动。
 
@@ -328,8 +335,9 @@ strm 内容  /vol1/1000/emby/strm/CloudNAS/CloudDrive/电影/…/xxx.mkv
 > —— uid 1000 实测 `Permission denied`，即便只是 `touch`。所以 compose 里是 `user: "0:0"`。
 > 不启用 remote 时可以改回 `1000:1000`（删 NAS 上的 strm 仍然可以 —— 见下「安全边界」）。
 
-> **为什么 `rslave` 不能省**：CD2 的 `CloudDrive` 是嵌套在 `CloudNAS` 下的**子挂载**。
-> 挂载传播不带 `rslave` 时，容器里 `/cloud` 是空的（只看到父挂载点的目录条目，看不到子挂载内容）。
+> **为什么 `rslave` 不能省**：CD2 的 `CloudDrive` 是挂在 `CloudNAS/CloudDrive` 上的**子挂载**
+> （`CloudFS ... type fuse`）。挂载传播不带 `rslave` 时，容器里 `/cloud` 只有父目录的条目，
+> 看不到子挂载内容 —— 表现为「容器里是空目录」。带了 `rslave` 后 CD2 重挂载也能自动传播进来。
 
 > **回收站**：网盘删除只让文件进回收站，**不立即释放空间**。要真正腾出空间需另行清空回收站
 > —— nankeep 刻意不做这一步（不可逆、易误伤）。
@@ -473,8 +481,8 @@ strm 内容  /vol1/1000/emby/strm/CloudNAS/CloudDrive/电影/…/xxx.mkv
   要人工判断就解 302 取真实源名/体积。
 - **体积择优未做**：strm 本身无体积，要比体积需解 302 取 115 真实文件大小 —— 会引入大量网络请求，属下一步。
 - **网盘删除只进回收站**，不立即释放空间；清空回收站是另一件事，nankeep 刻意不做（不可逆）。
-- **`host_prefix` 必须写全**（含 `CloudDrive` 那一层）。写错/写漏时映射失败 → 该片**跳过网盘删除**，
-  若 `delete_source` 为真则该片整体不动作（不会「strm 删了、网盘留着」）。
+- **`host_prefix` 照抄 compose volume 左侧**，一字不差。写错/写漏时映射出的容器路径不存在 →
+  该片**不进网盘删除清单**（只会删 strm），不会删错东西也不会静默「strm 删了、网盘留着」。
 - 本工具只处理 strm 的**择优与重复**；分类归位、tmdbid 补写、字幕语言码归位仍是既有技能的事。
   但删 strm 时会把**同名（去语言码）字幕一起删**，避免留下孤立字幕；与保留版共享的字幕不动。
 - **fail-safe 的次优点**：若最优版本指纹校验失败，计划保留它、执行时跳过 —— 安全但不够优
@@ -483,14 +491,14 @@ strm 内容  /vol1/1000/emby/strm/CloudNAS/CloudDrive/电影/…/xxx.mkv
 ## 开发与测试
 
 ```bash
-# stdlib 单测（146 例：解析/指纹/九维/缺集/命名/双库精简/完整性闸门/平局档/tmdb 配对/字幕跟删/
-#                  网盘路径映射/附属文件/空目录清理/设置层三合一校验/emit-sh 语义/
+# stdlib 单测（150 例：解析/指纹/九维/缺集/命名/双库精简/完整性闸门/平局档/tmdb 配对/字幕跟删/
+#                  网盘路径映射与归属判定/附属文件/空目录清理/设置层三合一校验/emit-sh 语义/
 #                  会话/CSRF/互斥锁/任务总线/计划守卫/fail-safe/渲染/总览聚合）
 python -m unittest discover -s tests -v
 
-# 端到端（119 项 HTTP 断言：登录→CSRF→扫描→报告→计划→双库动作→网盘侧标注→复核→dry-run→
-#                     确认短语→真删（含网盘源文件与空目录）→一次性→设置往返与作废→
-#                     总览聚合→静态资源与穿越→审计→登出）
+# 端到端（131 项 HTTP 断言：登录→CSRF→扫描→报告→计划→双库动作→网盘侧标注→导出脚本→
+#                     复核→dry-run→确认短语→真删（含网盘源文件与空目录）→一次性→
+#                     设置往返与作废→网盘归属闸门→总览聚合→静态资源与穿越→审计→登出）
 python tests/e2e.py
 ```
 

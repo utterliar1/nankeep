@@ -615,7 +615,7 @@
           "<ul>" + drops.map(function (x) {
             return "<li>" + esc(x.name) + (x.summary ? "<br><span class='dim'>" + esc(x.summary) + "</span>" : "") + "</li>";
           }).join("") + "</ul></div>" +
-        remoteBox(a) + dirsBox(a) +
+        remoteProblemBox(a) + remoteBox(a) + dirsBox(a) +
       "</div>" +
       compareBlock(a.compare) + subsLine + reasonLine + "</div>";
   }
@@ -652,6 +652,20 @@
     return '<div class="side-box wide remote"><div class="lbl">' + icon("cloud") +
       "网盘源文件一起删 " + remote.length + " 个（不可逆）</div>" +
       '<ul class="path-list">' + remote.map(pathLi).join("") + "</ul></div>";
+  }
+
+  /* 网盘源文件定位失败（多半是 remote.host_prefix 写错）：
+     计划整体不可执行。必须显式说明白，否则用户只看到「复核不通过」。
+     这是防「strm 删了、网盘文件还在占空间」的闸门。 */
+  function remoteProblemBox(a) {
+    var p = a.remote_problem;
+    if (!p) return "";
+    var files = p.files || [];
+    return '<div class="side-box wide remote bad"><div class="lbl">' +
+      icon("cloud") + "网盘源文件定位失败 · 本计划不可执行</div>" +
+      '<p class="note">' + esc(p.reason || "") + "</p>" +
+      (files.length ? '<ul class="path-list">' + files.map(pathLi).join("") + "</ul>" : "") +
+      "</div>";
   }
 
   /* 待清空的空目录：分网盘侧与 NAS 侧两块列出 */

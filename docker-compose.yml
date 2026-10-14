@@ -52,9 +52,10 @@ services:
       #    转存已整理里的 strm 内容是网盘挂载点上的宿主路径，nankeep 把它映射成
       #    容器内路径后直接 unlink —— 也就是真删网盘上的源文件（115 会同步删 strm）。
       #
-      #    `rslave` 不能省：CD2 的 CloudDrive 是嵌套在 CloudNAS 下的子挂载，
-      #    不带传播标志就看不见它，容器里会是空目录。
-      #    左侧填**挂载点根**（下面 config.json 的 host_prefix 要指向它里面的子目录）：
+      #    `rslave` 不能省：CD2 的 CloudDrive 是挂在 CloudNAS/CloudDrive 上的**子挂载**，
+      #    不带传播标志就看不见它，容器里会是空目录（CD2 重挂载也不会传进来）。
+      #
+      #    左侧就是 config.json 里 remote.host_prefix 该填的值 —— **一字不差照抄**：
       - /path/to/emby/strm/CloudNAS:/cloud:rslave
 
       # ③ 状态目录：SQLite（计划 + 审计）、索引缓存、互斥锁、界面改的设置覆盖文件

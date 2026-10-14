@@ -664,6 +664,10 @@ pre.json{background:#0f172a;color:#cbd5e1;border-radius:var(--r-sm);padding:12px
 .act .side-box.remote{background:var(--err-soft);border-color:var(--err-line)}
 .act .side-box.remote .lbl{color:var(--err)}
 .act .side-box.dirs{background:var(--surface-soft);border-color:var(--border)}
+/* 网盘源文件定位失败：比「待删」更重 —— 它是「不可执行」的原因 */
+.act .side-box.remote.bad{border-style:dashed;border-width:2px}
+.act .side-box.remote.bad .note{margin:6px 0 0;font-size:12px;line-height:1.6;
+  color:var(--text-mid)}
 .path-list{margin:0;padding-left:16px;font-size:11.5px;line-height:1.65;
   font-family:var(--mono);word-break:break-all}
 .path-list li{margin:2px 0}

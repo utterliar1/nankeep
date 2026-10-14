@@ -1369,6 +1369,30 @@ def _strm_content(path: str, limit: int = 4096) -> str:
         return ""
 
 
+def _remote_state(strm_path: str, cfg: dict) -> str:
+    """转存侧 strm 的网盘归属：`url` | `mapped` | `unmapped` | `no-host`。
+
+    与 `_remote_target` 的区别：目标函数只回答「映射到哪」，
+    这里回答「**该不该映射**」—— 用来把「配置写错」和「本来就是直链」分开。
+
+    为什么需要它：remote 已启用（用户明确要求删网盘源文件），若某个 strm 是挂载点
+    路径却匹配不上 host_prefix，那必然是把前缀写错了。此时如果照旧删 strm，
+    结果就是「strm 没了、网盘文件还在悄悄占空间」—— 正是这个功能要消灭的东西。
+    所以这一档必须让整份计划作废，而不是静默跳过。
+    """
+    content = _strm_content(strm_path)
+    if not content:
+        return "url"                      # 读不到内容 → 交给 NAS 侧指纹去管
+    if content.startswith(("http://", "https://")):
+        return "url"                      # 别人的 302 分享，本来就无网盘源文件可删
+    host = ((cfg.get("remote") or {}).get("host_prefix") or "").rstrip("/")
+    if not host:
+        return "no-host"
+    if content.startswith(host + "/") or content.startswith(host + "\\"):
+        return "mapped"
+    return "unmapped"
+
+
 def _remote_target(strm_path: str, cfg: dict):
     """转存侧 strm → 网盘源文件的**容器内路径**；不是网盘直链返回 None。
 
@@ -1490,6 +1514,7 @@ def _annotate_dirs(actions: list, cfg: dict) -> None:
         act.setdefault("remote", [])
         act.setdefault("remote_guard", {})
         act.setdefault("remote_rmdirs", [])
+        act.setdefault("remote_problem", None)
         if not files:
             continue
         # ① NAS 侧空目录：边界 = 每个文件所属的作品目录
@@ -1498,6 +1523,17 @@ def _annotate_dirs(actions: list, cfg: dict) -> None:
             act["rmdirs"] = _dirs_emptied_by(files, stops)
         # ② 网盘侧：转存已整理的 strm 指向网盘挂载点上的真实文件
         if not (remote_on and rm.get("delete_source", True)):
+            continue
+        # 先判归属：remote 开着却匹配不上 host_prefix = 前缀写错，必须整份计划作废
+        bad = [(p, _remote_state(p, cfg)) for p in files
+               if p.lower().endswith(VIDEO_EXTS)]
+        bad = [(p, st) for p, st in bad if st in ("unmapped", "no-host")]
+        if bad:
+            why = "remote.host_prefix 未配置" if bad[0][1] == "no-host" else \
+                  f"网盘路径前缀与 remote.host_prefix（{rm.get('host_prefix') or '未配置'}）不匹配"
+            act["remote_problem"] = {
+                "reason": f"{why} —— 网盘源文件定位失败，删 strm 也省不下空间",
+                "files": [p for p, _ in bad]}
             continue
         targets, stops = [], []
         for p in files:
@@ -2002,6 +2038,12 @@ def validate_plan(plan: dict) -> list:
     """
     bad = []
     for act in plan.get("actions", []):
+        prob = act.get("remote_problem")
+        if prob:
+            # 网盘源文件定位失败 → 整份计划不可执行。
+            # 否则会出现「strm 删了、网盘文件还在占空间」这种看不见的浪费。
+            for p in prob.get("files") or []:
+                bad.append({"path": p, "reason": prob.get("reason") or "网盘源文件定位失败"})
         for p in act.get("files", []):
             old = (act.get("guard") or {}).get(p)
             new = _fingerprint(p, exts=ALL_EXTS)
