@@ -885,10 +885,17 @@ def build_plan(idx: dict, kind: str, cfg: dict, min_conf: str = "weak") -> dict:
             continue
         keep = m["best"]
         drops = [c for c in m["candidates"] if c["name"] != keep]
+        keep_one = next((c for c in m["candidates"] if c["name"] == keep), None)
         act = {"dir": m["dir"], "name": m["name"], "cat": m["cat"],
                "season": m.get("season"), "ep": m.get("ep"),
                "keep": keep, "keep_path": m["best_path"],
+               # 规格摘要随计划一起落库：报告/Web 层要展示「保留什么、删什么」，
+               # 否则调用方只能拿文件名猜。
+               "keep_summary": (keep_one or {}).get("summary") or m.get("best_summary") or "",
+               "versions": m.get("count") or len(m["candidates"]),
                "drop": [d["name"] for d in drops],
+               "drop_detail": [{"name": d["name"], "path": d["path"],
+                                "summary": d["summary"]} for d in drops],
                "confidence": m.get("confidence"),
                "decided_by": m.get("decided_by"),
                "reason": f"{m['count']} 个版本择优（unknown={cfg.get('unknown')}，"

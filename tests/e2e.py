@@ -146,6 +146,10 @@ def main():
         s, d = call(op, port, f"/api/plan/{pid}")
         check("计划详情可读", s == 200 and d.get("state") == "pending")
         check("保留版均存在", all(a["keep_ok"] for a in d["actions"]))
+        check("动作带保留版规格与版本数",
+              all("keep_summary" in a and a.get("versions", 0) >= 2 for a in d["actions"]))
+        check("待删项带规格明细",
+              all(len(a.get("drop_detail") or []) == len(a.get("drop") or []) for a in d["actions"]))
         s, pv = call(op, port, f"/api/plan/{pid}/preview", "POST", {},
                      headers={"Origin": origin})
         check("复核通过", s == 200 and pv.get("executable") is True, str(pv.get("message")))
@@ -205,25 +209,50 @@ def main():
         check("审计详情含结构化结果", isinstance(r2.get("record", {}).get("extra"), dict))
         check("运行日志非空", len(call(op, port, "/api/logs?n=50")[1].get("lines", [])) > 3)
 
-        print("\n== 10. 静态资源 ==")
-        for name, needle in (("index.html", "nankeep"), ("app.css", "--blue"),
-                             ("app.js", "/api/plan/")):
-            s, txt = call(op, port, "/static/" + name, raw=True)
+        print("\n== 10. 总览聚合 ==")
+        s, ov = call(op, port, "/api/overview")
+        check("总览接口可用", s == 200 and ov.get("status") == "ok", f"got {s}")
+        st = ov.get("stats") or {}
+        sides = st.get("sides") or []
+        check("含两库规模", [x.get("key") for x in sides] == ["share", "transcode"],
+              str([x.get("key") for x in sides]))
+        check("strm 总数 > 0", (st.get("totals") or {}).get("strms", 0) > 0,
+              str((st.get("totals") or {}).get("strms")))
+        check("含分类分布", any((sd.get("movie") or sd.get("tv") or {}).get("categories")
+                              for sd in sides))
+        check("含治理计数", isinstance(ov.get("summary"), dict) and
+              "multi_version_movie" in (ov.get("summary") or {}))
+        check("含产物新鲜度", isinstance(ov.get("index"), dict) and ov["index"].get("exists") is True)
+        check("含计划与审计", isinstance(ov.get("plans"), list) and isinstance(ov.get("audit"), list))
+        check("含可写探测与版本", "writable" in ov and bool(ov.get("version")))
+
+        print("\n== 11. 静态资源 ==")
+        for path, needle in (("/static/index.html", "nankeep"),
+                             ("/static/app.css", "--brand"),
+                             ("/static/js/core.js", "NK.api"),
+                             ("/static/js/views.js", "NK.register"),
+                             ("/static/favicon.svg", "<svg")):
+            s, txt = call(op, port, path, raw=True)
             b = txt.decode("utf-8", "replace") if isinstance(txt, bytes) else str(txt)
-            check(f"{name} 可访问", s == 200 and needle in b, f"got {s}")
-        check("路径穿越被拒", call(op, port, "/static/../nankeep_web.py", raw=True)[0] == 404)
-        check("非白名单文件被拒", call(op, port, "/static/nankeep_web.py", raw=True)[0] == 404)
+            check(path + " 可访问", s == 200 and needle in b, f"got {s}")
+        check("旧单文件 app.js 已下线",
+              call(op, port, "/static/app.js", raw=True)[0] == 404)
+        check("路径穿越被拒", call(op, port, "/static/%2e%2e/nankeep_web.py", raw=True)[0] == 404)
+        check("深层穿越被拒", call(op, port, "/static/js/%2e%2e/%2e%2e/nankeep.py", raw=True)[0] == 404)
+        check("目录不被当文件下发", call(op, port, "/static/js", raw=True)[0] == 404)
+        check("非白名单扩展名被拒",
+              call(op, port, "/static/%2e%2e/nankeep.config.json", raw=True)[0] == 404)
         s, txt = call(op, port, "/", raw=True)
         b = txt.decode("utf-8", "replace") if isinstance(txt, bytes) else str(txt)
         check("根路径返回页面", s == 200 and "<title>nankeep" in b)
 
-        print("\n== 11. 幂等状态 ==")
+        print("\n== 12. 幂等状态 ==")
         s, r = call(op, port, "/api/task/scan", "POST", {}, headers={"Origin": origin})
         check("执行后仍可正常起任务", s == 200, f"{s} {r.get('message')}")
         if s == 200:
             wait_task(op, port, r["task_id"])
 
-        print("\n== 12. 登出 ==")
+        print("\n== 13. 登出 ==")
         call(op, port, "/api/logout", "POST")
         check("登出后 401", call(op, port, "/api/status")[0] == 401)
 

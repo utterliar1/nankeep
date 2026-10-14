@@ -6,6 +6,7 @@
 
 运行：python -m unittest discover -s tests -v
 """
+import json
 import os
 import sys
 import threading
@@ -406,6 +407,107 @@ class TestRenderMd(unittest.TestCase):
         h = W.render_md("正常 <script>alert(1)</script>")
         self.assertNotIn("<script>", h)
         self.assertIn("&lt;script&gt;", h)
+
+
+class TestOverviewAggregation(unittest.TestCase):
+    """总览页的数据源：_build_stats（规模/分布）与 _summary_counts（治理计数）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cfg = nk.load_cfg(ENV["conf"])
+        cfg["share_root"] = ENV["lib"]
+        cfg["out_dir"] = ENV["out"]
+        cls.scans = nk._run_scan(cfg, ENV["lib"],
+                                 [("share", nk.LIB_SHARE), ("transcode", nk.LIB_TRANSCODE)],
+                                 ENV["out"], log=lambda *a: None, use_cache=False)
+        cls.idx = nk.analyze_all(cls.scans, cfg)
+        cls.stats = W._build_stats(cls.scans)
+        cls.summary = W._summary_counts(cls.idx)
+
+    def _side(self, key):
+        return next(s for s in self.stats["sides"] if s["key"] == key)
+
+    def test_two_sides(self):
+        self.assertEqual([s["key"] for s in self.stats["sides"]], ["share", "transcode"])
+        self.assertEqual(self._side("share")["lib"], nk.LIB_SHARE)
+
+    def test_movie_block_counts(self):
+        mv = self._side("share")["movie"]
+        self.assertEqual(mv["titles"], 4)
+        self.assertEqual(mv["strms"], 7)
+
+    def test_tv_block_counts(self):
+        tv = self._side("share")["tv"]
+        self.assertEqual(tv["titles"], 2)
+        self.assertEqual(tv["strms"], 6)
+        self.assertEqual(tv["seasons"], 2)
+
+    def test_empty_side_is_zeroed(self):
+        tc = self._side("transcode")
+        self.assertEqual(tc["total"]["strms"], 0)
+        self.assertEqual(tc["movie"]["titles"], 0)
+
+    def test_categories_sorted_by_strms(self):
+        cats = self._side("share")["movie"]["categories"]
+        self.assertEqual(cats[0]["cat"], "其他电影")
+        self.assertEqual(cats[0]["strms"], 4)
+        self.assertEqual([c["strms"] for c in cats], sorted([c["strms"] for c in cats],
+                                                            reverse=True))
+
+    def test_totals(self):
+        t = self.stats["totals"]
+        self.assertEqual(t["strms"], 13)
+        self.assertEqual(t["movie_titles"], 4)
+        self.assertEqual(t["tv_titles"], 2)
+        self.assertEqual(t["seasons"], 2)
+
+    def test_stats_json_is_small(self):
+        """总览页要反复读它，必须是小文件（不得内嵌逐条明细）。"""
+        blob = json.dumps(_jsonable(self.stats), ensure_ascii=False)
+        self.assertLess(len(blob), 20000)
+        self.assertNotIn("\"candidates\"", blob)
+
+    def test_summary_counts(self):
+        s = self.summary
+        self.assertEqual(s["multi_version_movie"], 2)
+        self.assertEqual(s["multi_version_tv"], 1)
+        self.assertGreaterEqual(s["missing"], 1)
+        self.assertGreaterEqual(s["missing_certain"], 1)
+        self.assertGreaterEqual(s["confidence"].get("high", 0), 1)
+        self.assertEqual(s["errors"], 0)
+
+    def test_summary_has_no_heavy_lists(self):
+        for k, v in self.summary.items():
+            self.assertIsInstance(v, (int, dict), f"{k} 不该是列表")
+
+    def test_artifact_missing(self):
+        a = W._artifact(os.path.join(ENV["base"], "不存在.json"))
+        self.assertFalse(a["exists"])
+        self.assertEqual(a["size"], 0)
+
+    def test_artifact_present(self):
+        p = os.path.join(ENV["out"], "_probe.json")
+        W._write_json(p, {"a": 1})
+        a = W._artifact(p)
+        self.assertTrue(a["exists"])
+        self.assertGreater(a["size"], 0)
+        self.assertEqual(W._read_json(p), {"a": 1})
+        os.unlink(p)
+
+    def test_read_json_bad_input(self):
+        p = os.path.join(ENV["out"], "_bad.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{不是 json")
+        self.assertIsNone(W._read_json(p))
+        os.unlink(p)
+
+
+def _jsonable(obj):
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_jsonable(v) for v in obj]
+    return obj
 
 
 class TestConfigAndPaths(unittest.TestCase):

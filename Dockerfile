@@ -29,13 +29,14 @@ RUN chmod -R a+rX /app \
 
 # 非 root 运行。实测（2026-10-14，NAS 上 docker run 验证）：
 # uid 1000 在容器内即可对库目录 touch/cp/rm——包括 root:root 700 属主的目录，
-# 与宿主运行用户的行为一致（fnOS 对 Administrators 组的存储层特权，不随容器边界失效）。
+# 与该宿主账号在容器外的行为一致（fnOS 对 Administrators 组的存储层特权，不随容器边界失效）。
 USER 1000:1000
 
 ENV NANKEEP_DATA=/data \
     NANKEEP_OUT=/data/out \
     NANKEEP_ROOT=/library \
     NANKEEP_PORT=8322 \
+    NANKEEP_VERSION=${APP_VERSION} \
     NANKEEP_BIND=0.0.0.0
 
 EXPOSE 8322

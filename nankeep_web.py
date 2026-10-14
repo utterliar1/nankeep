@@ -57,6 +57,7 @@ ALLOW_NO_AUTH = os.environ.get("NANKEEP_ALLOW_NO_AUTH", "") == "1"
 
 PORT = int(os.environ.get("NANKEEP_PORT", "8322"))
 BIND = os.environ.get("NANKEEP_BIND", "0.0.0.0")
+APP_VERSION = (os.environ.get("NANKEEP_VERSION", "").strip() or "dev")
 ROOT = os.environ.get("NANKEEP_ROOT", "/data/strm/nanshare").rstrip("/")
 DATA_DIR = os.environ.get("NANKEEP_DATA", "/data").rstrip("/")
 OUT_DIR = (os.environ.get("NANKEEP_OUT", "").strip() or f"{DATA_DIR}/out").rstrip("/")
@@ -73,7 +74,10 @@ MAX_BODY = 1 << 20
 LOG_KEEP = 2000
 
 LIB_SELECT = [("share", nk.LIB_SHARE), ("transcode", nk.LIB_TRANSCODE)]
-PUBLIC_FILES = {"index.html", "app.css", "app.js"}
+
+# 静态资源：不再逐个文件名白名单，改为「目录包含性 + 扩展名白名单」。
+# 仍然拒绝 `.` 开头、`..`、目录列表，且 realpath 必须落在 STATIC_DIR 内。
+STATIC_EXTS = (".html", ".css", ".js", ".svg", ".png", ".webp", ".ico", ".woff2")
 
 
 def _host_of(url: str) -> str:
@@ -446,6 +450,107 @@ def rule_sig(cfg):
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
+# ── 总览聚合（stats.json / summary.json 都是 <100KB 的小文件，总览页直接读） ──
+
+def _write_json(path, obj):
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+
+
+def _read_json(path):
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _build_stats(scans):
+    """把扫描结果压成总览页要用的「规模 + 分布」，不含逐条明细。
+
+    明细留在 library.json.gz；这里只留计数，保证总览页读的是几十 KB。
+    """
+    sides, totals = [], {"strms": 0, "titles": 0, "movie_titles": 0,
+                         "tv_titles": 0, "seasons": 0, "errors": 0}
+    for key in ("share", "transcode"):
+        side = {"key": key, "lib": "", "movie": None, "tv": None,
+                "total": {"titles": 0, "strms": 0, "seasons": 0}}
+        for sc in scans.get(key) or []:
+            side["lib"] = sc.get("lib") or side["lib"]
+            kind = sc.get("kind")
+            entries = sc.get("entries") or []
+            cats = {}
+            for e in entries:
+                cat = e.get("cat") or "未分类"
+                c = cats.setdefault(cat, {"cat": cat, "titles": 0, "strms": 0, "seasons": 0})
+                c["titles"] += 1
+                c["strms"] += len(e.get("strms") or [])
+                if kind == nk.KIND_TV:
+                    c["seasons"] += len(e.get("seasons") or [])
+            block = {
+                "titles": len(entries),
+                "strms": sum(len(e.get("strms") or []) for e in entries),
+                "errors": len(sc.get("errors") or []),
+                "categories": sorted(cats.values(), key=lambda x: (-x["strms"], x["cat"])),
+            }
+            if kind == nk.KIND_TV:
+                block["seasons"] = sum(len(e.get("seasons") or []) for e in entries)
+                totals["seasons"] += block["seasons"]
+                totals["tv_titles"] += block["titles"]
+                side["tv"] = block
+            else:
+                totals["movie_titles"] += block["titles"]
+                side["movie"] = block
+            totals["titles"] += block["titles"]
+            totals["strms"] += block["strms"]
+            totals["errors"] += block["errors"]
+            side["total"]["titles"] += block["titles"]
+            side["total"]["strms"] += block["strms"]
+            side["total"]["seasons"] += block.get("seasons", 0)
+        sides.append(side)
+    return {"generated": time.time(), "sides": sides, "totals": totals}
+
+
+def _summary_counts(idx):
+    """治理结论计数（报告页与总览页共用）。"""
+    mv = idx["multi_version"]
+    conf = {}
+    for m in mv:
+        k = m.get("confidence") or "weak"
+        conf[k] = conf.get(k, 0) + 1
+    missing = idx["missing"]
+    cross = idx["cross"]
+    return {
+        "multi_version_movie": sum(1 for m in mv if m["kind_family"] == nk.KIND_MOVIE),
+        "multi_version_tv": sum(1 for m in mv if m["kind_family"] == nk.KIND_TV),
+        "confidence": conf,
+        "mixed_season": len(idx["mixed_season"]),
+        "missing": len(missing),
+        "missing_certain": sum(1 for m in missing if m.get("certain")),
+        "naming": len(idx["naming"]),
+        "orphan_subs": len(idx["orphan_subs"]),
+        "cross_only_transcode": len(cross["only_transcode"]),
+        "cross_only_share": len(cross["only_share"]),
+        "cross_share_total": cross["share_total"],
+        "cross_tc_total": cross["tc_total"],
+        "errors": len(idx["errors"]),
+    }
+
+
+def _out_file(name):
+    return f"{OUT_DIR}/{name}"
+
+
+def _artifact(path):
+    """文件类产物的存在性/大小/时间，总览页用它显示「数据新鲜度」。"""
+    if not os.path.isfile(path):
+        return {"exists": False, "size": 0, "mtime": 0}
+    st = os.stat(path)
+    return {"exists": True, "size": st.st_size, "mtime": st.st_mtime}
+
+
 def _scan_raw(task, cfg, use_cache):
     """真正扫描，返回 scans。取消 = 在 log 回调里抛 TaskCancelled。"""
     def tlog(*a):
@@ -457,11 +562,22 @@ def _scan_raw(task, cfg, use_cache):
     return nk._run_scan(cfg, ROOT, LIB_SELECT, OUT_DIR, log=tlog, use_cache=use_cache)
 
 
+def _save_artifacts(scans, idx=None):
+    """落总览页要的小文件。失败只记日志，不影响主流程（总览页会显示「暂无数据」）。"""
+    try:
+        _write_json(_out_file("stats.json"), _build_stats(scans))
+        if idx is not None:
+            _write_json(_out_file("summary.json"), _summary_counts(idx))
+    except OSError as e:
+        log(f"[stats] 总览数据写入失败：{e}")
+
+
 def do_scan(task, use_cache=False):
     cfg = load_cfg()
     t0 = time.time()
     scans = _scan_raw(task, cfg, use_cache)
     n = sum(len(sc["entries"]) for sc in scans.get("share", []))
+    _save_artifacts(scans)
     return {"seconds": round(time.time() - t0, 1), "share_entries": n,
             "cache": f"{OUT_DIR}/library.json.gz"}
 
@@ -474,9 +590,9 @@ def do_report(task, top=50, use_cache=True):
     path = f"{OUT_DIR}/report.md"
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(nk.build_report(idx, scans, top, cfg))
-    with open(f"{OUT_DIR}/analysis.json", "w", encoding="utf-8") as f:
-        json.dump({k: v for k, v in idx.items() if k != "root"}, f,
-                  ensure_ascii=False, indent=1)
+    _write_json(_out_file("analysis.json"),
+                {k: v for k, v in idx.items() if k != "root"})
+    _save_artifacts(scans, idx)
     task.emit(f"报告已写 {path}")
     return {"path": path, "multi_version": len(idx["multi_version"]),
             "missing": len(idx["missing"]), "naming": len(idx["naming"])}
@@ -499,6 +615,7 @@ def do_plan(task, kind="movie", min_confidence="weak", use_cache=True):
                    len(plan["actions"]), files, summary)
     with open(f"{OUT_DIR}/plan_{kind}.json", "w", encoding="utf-8") as f:
         json.dump(plan, f, ensure_ascii=False, indent=1)
+    _save_artifacts(scans, idx)
     task.emit(f"计划 {pid}：{summary}")
     STORE.add_audit("生成计划", f"{kind} · {summary}",
                     f"plan_id={pid} min_confidence={min_confidence} rule_sig={sig}", ok=1)
@@ -821,24 +938,43 @@ class Handler(BaseHTTPRequestHandler):
             log(traceback.format_exc())
             return self._err(500, f"{type(e).__name__}: {e}")
 
+    _CTYPES = {
+        ".html": "text/html; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".js": "application/javascript; charset=utf-8",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".ico": "image/x-icon",
+        ".woff2": "font/woff2",
+    }
+
     def serve_static(self, path):
         rel = path[len("/static/"):]
-        if "/" in rel or rel.startswith(".") or rel not in PUBLIC_FILES:
+        if not rel or rel.startswith(".") or any(
+                p in ("", ".", "..") for p in rel.split("/")):
             return self._err(404, "not found")
-        full = f"{STATIC_DIR}/{rel}"
-        if not os.path.isfile(full):
+        root = os.path.realpath(STATIC_DIR)
+        full = os.path.realpath(os.path.join(root, rel))
+        if not full.startswith(root + os.sep):               # 目录穿越（含符号链接）
             return self._err(404, "not found")
-        ctype = ("text/html; charset=utf-8" if rel.endswith(".html")
-                 else "text/css; charset=utf-8" if rel.endswith(".css")
-                 else "application/javascript; charset=utf-8")
-        with open(full, "rb") as f:
-            self._send(200, f.read(), ctype)
+        ext = os.path.splitext(full)[1].lower()
+        if ext not in STATIC_EXTS or not os.path.isfile(full):
+            return self._err(404, "not found")
+        try:
+            with open(full, "rb") as f:
+                body = f.read()
+        except OSError:
+            return self._err(404, "not found")
+        self._send(200, body, self._CTYPES[ext],
+                   headers=[("Cache-Control", "no-cache")])
 
 
 # ── 路由表 ──
 
 def r_health(h, q):
-    h._json({"status": "ok", "auth_required": not ALLOW_NO_AUTH, "ts": time.time()})
+    h._json({"status": "ok", "auth_required": not ALLOW_NO_AUTH, "ts": time.time(),
+             "version": APP_VERSION})
 
 
 def r_index(h, q):
@@ -868,41 +1004,78 @@ def r_me(h, q):
     if h.need_auth():
         return
     h._json({"status": "ok", "user": WEB_USER, "root": ROOT,
+             "version": APP_VERSION,
              "busy": TASKS.busy(), "logs": LOG.size()})
 
 
-def _writable_check():
-    """探测库根可写性——不可写时前端应显眼提示「只能 dry-run」。"""
+_WRITABLE_CACHE = {"t": 0.0, "v": None}
+
+
+def _writable_check(ttl=60.0):
+    """探测库根可写性——不可写时前端应显眼提示「只能 dry-run」。
+
+    带 TTL 缓存：总览页会周期轮询，不该每 5 秒都往库里写一次探针文件。
+    """
+    now = time.time()
+    if _WRITABLE_CACHE["v"] is not None and now - _WRITABLE_CACHE["t"] < ttl:
+        return _WRITABLE_CACHE["v"]
     try:
         if not os.path.isdir(ROOT):
-            return {"ok": False, "reason": "库根不存在"}
-        probe = f"{ROOT}/.nankeep_write_probe"
-        with open(probe, "w") as f:
-            f.write("x")
-        os.unlink(probe)
-        return {"ok": True, "reason": ""}
+            val = {"ok": False, "reason": "库根不存在", "ts": now}
+        else:
+            probe = f"{ROOT}/.nankeep_write_probe"
+            with open(probe, "w") as f:
+                f.write("x")
+            os.unlink(probe)
+            val = {"ok": True, "reason": "", "ts": now}
     except OSError as e:
-        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+        val = {"ok": False, "reason": f"{type(e).__name__}: {e}", "ts": now}
+    _WRITABLE_CACHE.update(t=now, v=val)
+    return val
 
 
 def r_status(h, q):
     if h.need_auth():
         return
     cfg = load_cfg()
-    idx, rep = f"{OUT_DIR}/library.json.gz", f"{OUT_DIR}/report.md"
     h._json({
         "status": "ok", "root": ROOT, "root_exists": os.path.isdir(ROOT),
         "out_dir": OUT_DIR, "data_dir": DATA_DIR,
-        "index": {"exists": os.path.isfile(idx),
-                  "size": os.path.getsize(idx) if os.path.isfile(idx) else 0,
-                  "mtime": os.path.getmtime(idx) if os.path.isfile(idx) else 0},
-        "report": {"exists": os.path.isfile(rep),
-                   "mtime": os.path.getmtime(rep) if os.path.isfile(rep) else 0},
+        "index": _artifact(_out_file("library.json.gz")),
+        "report": _artifact(_out_file("report.md")),
         "plans_pending": STORE.count_pending(),
         "plan_ttl_min": PLAN_TTL_MIN, "confirm_phrase": CONFIRM_PHRASE,
         "rule_sig": rule_sig(cfg),
         "quality": {k: cfg.get(k) for k in ("unknown", "order", "enabled")},
         "busy": TASKS.busy(), "writable": _writable_check(),
+    })
+
+
+def r_overview(h, q):
+    """总览页一次拿全：规模/分布 + 治理计数 + 计划 + 最近审计 + 运行状态。
+
+    刻意做成单接口：前端只轮询这一条，避免 NAS 上并发一堆小请求。
+    """
+    if h.need_auth():
+        return
+    cfg = load_cfg()
+    now = time.time()
+    plans = STORE.list_plans(limit=12)
+    for p in plans:
+        p["expired"] = p["expires"] < now
+    h._json({
+        "status": "ok", "ts": now, "root": ROOT, "version": APP_VERSION,
+        "stats": _read_json(_out_file("stats.json")),
+        "summary": _read_json(_out_file("summary.json")),
+        "index": _artifact(_out_file("library.json.gz")),
+        "report": _artifact(_out_file("report.md")),
+        "plans": plans, "plans_pending": STORE.count_pending(),
+        "audit": STORE.list_audit(limit=8),
+        "busy": TASKS.busy(), "writable": _writable_check(),
+        "plan_ttl_min": PLAN_TTL_MIN, "confirm_phrase": CONFIRM_PHRASE,
+        "rule_sig": rule_sig(cfg),
+        "quality": {k: cfg.get(k) for k in ("unknown", "order", "enabled")},
+        "catalog": {"movie": nk.KIND_MOVIE, "tv": nk.KIND_TV},
     })
 
 
@@ -939,7 +1112,10 @@ def r_plan_detail(h, q, pid):
         "dir": a.get("dir"), "name": a.get("name"), "cat": a.get("cat"),
         "season": a.get("season"), "ep": a.get("ep"), "keep": a.get("keep"),
         "keep_ok": nk._fingerprint(a.get("keep_path")) is not None,
-        "drop": a.get("drop", []), "files": a.get("files", []),
+        "keep_summary": a.get("keep_summary") or "",
+        "versions": a.get("versions") or (len(a.get("drop") or []) + 1),
+        "drop": a.get("drop", []), "drop_detail": a.get("drop_detail") or [],
+        "files": a.get("files", []),
         "confidence": a.get("confidence"), "decided_by": a.get("decided_by"),
         "reason": a.get("reason"),
     } for a in plan.get("actions", [])]
@@ -1084,6 +1260,7 @@ ROUTES = {
     ("GET", "/api/health"): r_health,
     ("GET", "/api/me"): r_me,
     ("GET", "/api/status"): r_status,
+    ("GET", "/api/overview"): r_overview,
     ("GET", "/api/report"): r_report,
     ("GET", "/api/plans"): r_plans,
     ("GET", "/api/audit"): r_audit,
