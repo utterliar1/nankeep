@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.source="https://github.com/utterliar1/nankeep"
-LABEL org.opencontainers.image.description="NanShare strm 库治理 · 只读优先 + 复核后二次确认删除"
+LABEL org.opencontainers.image.description="NanShare strm 库精简 · 只读优先 + 复核后二次确认删除"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
 # 本项目 stdlib only：没有 requirements.txt，也没有 pip install 步骤
 # --chown + chmod：COPY 会保留「构建宿主的文件模式」（受宿主 umask 影响，可能是 0600），
 # 而运行用户是 uid 1000 —— 不显式放开就会 `Permission denied` 读不到 .py。
-COPY --chown=1000:1000 nankeep.py nankeep_web.py nankeep.config.json ./
+COPY --chown=1000:1000 nankeep.py nankeep_web.py nankeep_domain.py nankeep.config.json ./
 COPY --chown=1000:1000 static/ ./static/
 
 RUN chmod -R a+rX /app \
@@ -45,3 +45,4 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s \
   CMD python -c "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8322/api/health',timeout=4).status==200 else 1)"
 
 CMD ["python", "-u", "nankeep_web.py"]
+

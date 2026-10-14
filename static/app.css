@@ -290,7 +290,7 @@ input[type=checkbox]{width:16px;height:16px;accent-color:var(--brand);cursor:poi
 .cols > *{min-width:0}
 .stack{display:flex;flex-direction:column;gap:0}
 
-/* ── 治理待办 ── */
+/* ── 精简待办 ── */
 .todo-grid{display:grid;gap:9px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
 .todo{
   text-align:left;background:var(--surface-soft);border:1px solid var(--border);
@@ -419,7 +419,9 @@ input[type=checkbox]{width:16px;height:16px;accent-color:var(--brand);cursor:poi
 .cmp{display:grid;gap:9px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
 .side-box{border:1px solid var(--border);border-radius:var(--r-sm);padding:9px 11px;background:var(--surface-solid)}
 .side-box .lbl{font-size:10.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
-  margin-bottom:5px;display:flex;align-items:center;gap:6px}
+  margin-bottom:5px;display:flex;align-items:center;gap:6px;line-height:1.2}
+/* SVG 没有显式尺寸时会退化成 300×150，把整张卡片撑爆 —— 这里必须钉死 */
+.side-box .lbl svg{width:13px;height:13px;flex:none}
 .side-box.keep{border-color:var(--ok-line);background:var(--ok-soft)}
 .side-box.keep .lbl{color:var(--ok)}
 .side-box.drop{border-color:var(--err-line);background:var(--err-soft)}
@@ -429,6 +431,47 @@ input[type=checkbox]{width:16px;height:16px;accent-color:var(--brand);cursor:poi
 .side-box ul{margin:5px 0 0;padding-left:16px}
 .side-box li{font-family:var(--mono);font-size:11.5px;word-break:break-all;margin:3px 0}
 .reason{font-size:11.5px;color:var(--text-dim);margin-top:8px}
+
+/* ── 逐维对比证据（动作卡里展开「为什么判它更优」） ── */
+.ev{margin-top:8px;border:1px solid var(--border);border-radius:var(--r-sm);overflow:hidden}
+.ev summary{cursor:pointer;padding:7px 10px;font-size:11.5px;color:var(--text-mid);
+  background:var(--surface-soft);list-style:none;display:flex;align-items:center;gap:7px}
+.ev summary::-webkit-details-marker{display:none}
+.ev summary::before{content:"▸";font-size:9px;color:var(--text-dim);flex:none}
+.ev[open] summary::before{content:"▾"}
+.ev summary:hover{background:var(--hover)}
+.ev .ev-by{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--brand)}
+.ev-body{padding:2px 0}
+.ev-row{display:grid;grid-template-columns:74px minmax(0,1fr) 34px minmax(0,1fr);
+  gap:6px;align-items:center;padding:5px 10px;font-size:11.5px;border-top:1px solid var(--border)}
+.ev-row:first-child{border-top:0}
+.ev-row .k{color:var(--text-dim);font-size:10.5px;letter-spacing:.03em;text-transform:uppercase}
+.ev-row .v{font-family:var(--mono);word-break:break-all}
+.ev-row .v.a{text-align:right}
+.ev-row .v.win{color:var(--ok);font-weight:700}
+.ev-row .v.lose{color:var(--text-dim)}
+.ev-row .tag{text-align:center;font-size:9.5px;color:var(--text-dim);font-family:var(--mono)}
+/* 已定胜负之后的维度：只降权文字颜色，不整行压暗 —— 规格本身仍要看得清 */
+.ev-row.dim .v{color:var(--text-mid)}
+.ev-row.dim .k{opacity:.75}
+.ev-head{display:grid;grid-template-columns:74px minmax(0,1fr) 34px minmax(0,1fr);
+  gap:6px;padding:6px 10px;font-size:10px;color:var(--text-dim);background:var(--surface-soft)}
+.ev-head .v.a{text-align:right}
+.ev-note{padding:6px 10px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)}
+
+/* ── 策略条（决策模型 / 平局档 / 达标率） ── */
+.strat{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:11px}
+.strat .s{display:flex;align-items:center;gap:6px;font-size:11px;padding:4px 9px;
+  border-radius:999px;background:var(--surface-soft);border:1px solid var(--border);
+  color:var(--text-mid)}
+.strat .s svg{width:12px;height:12px;flex:none;opacity:.75}
+.strat .s b{color:var(--text);font-weight:650}
+.strat .s.tone-brand{background:var(--brand-soft);border-color:var(--brand-line);color:var(--brand)}
+.strat .s.tone-brand b{color:var(--brand)}
+.strat .s.tone-warn{background:var(--warn-soft);border-color:var(--warn-line);color:var(--warn)}
+.strat .s.tone-warn b{color:var(--warn)}
+.strat .s.tone-ok{background:var(--ok-soft);border-color:var(--ok-line);color:var(--ok)}
+.strat .s.tone-ok b{color:var(--ok)}
 .verdict{margin:12px 0}
 .review-list{margin:8px 0 0;padding-left:18px;font-size:12px}
 .review-list li{margin:3px 0;font-family:var(--mono);font-size:11.5px;word-break:break-all}
@@ -576,3 +619,4 @@ pre.json{background:#0f172a;color:#cbd5e1;border-radius:var(--r-sm);padding:12px
 @media(prefers-reduced-motion:reduce){
   *{animation-duration:.01ms !important;transition-duration:.01ms !important}
 }
+

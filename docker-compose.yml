@@ -44,6 +44,13 @@ services:
       #    安装后需 chown 到 1000:1000，见 README
       - ./data:/data
 
+      # ③ 配置文件（只读）。改画质档位/策略（decision、tie_keep、达标率…）后
+      #    重启容器即生效；rule_sig 会随之变化，旧计划自动作废，不会拿新规则删旧结论。
+      #    容器内已有同路径的默认配置，挂载会覆盖它 —— 先把仓库里的 nankeep.config.json
+      #    复制到 compose 同目录再改：
+      #      cp nankeep.config.json ./config.json
+      - ./config.json:/app/nankeep.config.json:ro
+
     logging:
       driver: json-file
       options:

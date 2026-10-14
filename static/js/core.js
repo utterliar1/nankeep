@@ -36,11 +36,17 @@
     download: '<path d="M12 3v12"/><path d="m7 11 5 5 5-5"/><path d="M4 20h16"/>',
     copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
     play: '<path d="m6 4 14 8-14 8V4Z"/>',
+    scale: '<path d="M12 4v16"/><path d="M4 8h16"/><path d="m7 8 3 6H4l3-6Z"/>' +
+           '<path d="m17 8 3 6h-6l3-6Z"/>',
     refresh: '<path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/>'
   };
   var icon = NK.icon = function (name) {
     var d = P[name] || P.file;
-    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+    // width/height 用 1em：没有专门 CSS 约束时按所在元素字号渲染，
+    // 不会再退化成 SVG 默认的 300×150（那正是图标撑满卡片的元凶）。
+    // 已有 CSS（.btn svg 等）优先级高于属性，照旧覆盖。
+    return '<svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" ' +
+           'stroke="currentColor" stroke-width="1.8" ' +
            'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + d + '</svg>';
   };
   NK.hydrateIcons = function (root) {

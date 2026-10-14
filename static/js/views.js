@@ -10,6 +10,11 @@
   var PALETTE = ["#007aff", "#5856d6", "#30b0c7", "#10b981", "#f59e0b",
                  "#ef4444", "#8b5cf6", "#0ea5e9", "#84cc16", "#f472b6"];
   var CONF_NAME = { high: "high·硬维度", medium: "medium·次维度", weak: "weak·勉强", tie: "tie·完全等价" };
+  var DEC_NAME = { quality_first: "画质优先", keep_local: "保留转存", keep_share: "保留分享" };
+  var TIE_NAME = { skip: "平局不动", local: "平局保留转存", share: "平局保留分享" };
+  var DIM_NAME = { resolution: "分辨率", source: "片源", dolby: "杜比/HDR", vcodec: "视频编码",
+                   bitdepth: "位深", fps: "帧率", audio: "音轨", channels: "声道",
+                   release_group: "发布组" };
   var STATE_NAME = { pending: "待执行", done: "已执行", expired: "已过期",
                      stale: "已作废（配置变更）", voided: "已作废", error: "异常" };
   var STATE_PILL = { pending: "warn", done: "ok", expired: "plain",
@@ -80,7 +85,7 @@
     });
     var hero = "";
     if (!st) {
-      hero = empty("scan", "还没有扫描过库", "点右上「扫描库」建立索引，再「生成报告」得到治理结论");
+      hero = empty("scan", "还没有扫描过库", "点右上「扫描库」建立索引，再「生成报告」得到精简结论");
     } else {
       hero += kpi("分享库 · strm", NK.num(share ? share.total.strms : 0), "个",
                   share ? share.total.titles + " 部作品" : "—");
@@ -96,10 +101,10 @@
     $("#ovHero").innerHTML = hero;
     $("#ovUpdated").textContent = "数据更新 " + NK.now();
 
-    /* 治理待办 */
+    /* 精简待办 */
     var todo = "", hint = "";
     if (!sm) {
-      todo = empty("report", "还没有治理结论", "生成一次报告即可得到多版本 / 缺集 / 命名等计数");
+      todo = empty("report", "还没有精简结论", "生成一次报告即可得到多版本 / 缺集 / 命名等计数");
       hint = "summary.json 不存在";
     } else {
       var c = sm.confidence || {};
@@ -115,7 +120,9 @@
       todo += todoCard(sm.orphan_subs, "孤立字幕", "无对应 strm 的字幕文件", sm.orphan_subs ? "warn" : "zero", 5);
       todo += todoCard(sm.cross_only_transcode, "仅转存库有", "分享库缺 · 需人工确认", 
                        sm.cross_only_transcode ? "info" : "zero", 6);
-      if (sm.errors) todo += todoCard(sm.errors, "扫描错误", "有目录读取失败", "err", 7);
+      todo += todoCard(sm.dual_actions, "双库精简", "按画质 / 完整度生成待删动作",
+                       sm.dual_actions ? "info" : "zero", 7);
+      if (sm.errors) todo += todoCard(sm.errors, "扫描错误", "有目录读取失败", "err", 8);
     }
     $("#ovTodo").innerHTML = todo;
     $("#ovTodoHint").textContent = hint;
@@ -123,7 +130,7 @@
       el.addEventListener("click", function () { NK.go("report", Number(el.getAttribute("data-sec"))); });
     });
 
-    /* 最近治理 */
+    /* 最近精简 */
     $("#ovAudit").innerHTML = renderTimeline(ov.audit, { short: true, clickable: true });
     $$("#ovAudit .tl-body").forEach(function (el) {
       el.addEventListener("click", function () { openAudit(Number(el.getAttribute("data-aid"))); });
@@ -232,7 +239,7 @@
   var repRaw = "", repSecs = [];
 
   NK.register({
-    id: "report", name: "治理报告", icon: "report", poll: 0,
+    id: "report", name: "精简报告", icon: "report", poll: 0,
     load: function (arg) {
       return NK.api("GET", "/api/report").then(function (r) {
         renderReport(r);
@@ -249,7 +256,7 @@
       body.innerHTML = "";
       nav.innerHTML = "";
       banner.innerHTML = '<div class="banner warn">尚未生成报告。点右上「重新生成」，' +
-                         "会先扫描库再产出治理结论（约 30 秒 / 全量）。</div>";
+                         "会先扫描库再产出精简结论（约 30 秒 / 全量）。</div>";
       $("#repMeta").textContent = "—";
       emptyEl.innerHTML = empty("report", "还没有报告", "报告包含规模、多版本、混版本、缺集、命名、孤立字幕、跨库对照");
       emptyEl.classList.remove("hidden");
@@ -270,6 +277,7 @@
         chip("命名异常", sm.naming, "", "warn") +
         chip("孤立字幕", sm.orphan_subs, "", "plain") +
         chip("跨库独有", sm.cross_only_transcode, "仅转存库", "plain") +
+        chip("双库精简", sm.dual_actions || 0, (sm.dual_files || 0) + " 个待删文件", "info") +
         "</div>";
     } else {
       banner.innerHTML = "";
@@ -435,6 +443,20 @@
         pill("未知规格", strg.unknown || "—", "plain") +
       "</div>";
 
+    /* 策略条：双库精简的裁决口径。读不出这些值，用户就没法预判计划会删哪边。 */
+    var dualActs = (d.actions || []).filter(function (a) { return a.scope === "cross"; });
+    if (dualActs.length) {
+      html += '<div class="strat">' +
+        strat("scale", "决策模型", DEC_NAME[strg.decision] || strg.decision || "—",
+              strg.decision === "quality_first" ? "" : "tone-brand") +
+        strat("shield", "平局档", TIE_NAME[strg.tie_keep] || strg.tie_keep || "skip",
+              strg.tie_keep === "skip" ? "tone-ok" : "tone-warn") +
+        strat("check", "季达标率", fmtRatio(strg.season_replace_ratio)) +
+        strat("plan", "多季保护", strg.multi_season_protect === "off" ? "关闭" : "开启") +
+        strat("file", "作品配对", strg.match === "tmdb_first" ? "TMDB 优先（校验年份）" : "片名 + 年份") +
+        "</div>";
+    }
+
     /* 执行结果（若已执行过） */
     if (d.result) {
       var res = d.result, tone = res.status === "done" ? "ok" : (res.status === "dry_run" ? "info" : "warn");
@@ -473,15 +495,72 @@
            "<b style='font-weight:700'>" + esc(value) + "</b></span>";
   }
 
+  function strat(ic, label, value, tone) {
+    return '<span class="s ' + (tone || "") + '">' + icon(ic) + esc(label) +
+           " <b>" + esc(value) + "</b></span>";
+  }
+
+  function fmtRatio(v) {
+    var n = Number(v);
+    if (!isFinite(n)) return "—";
+    return Math.round(n * 100) + "%";
+  }
+
+  function shortName(s, n) {
+    s = String(s || "");
+    n = n || 34;
+    return s.length > n ? "…" + s.slice(-n) : s;
+  }
+
+  /* 逐维对比证据：把「为什么判它更优」摊开给用户看（默认折叠） */
+  function compareBlock(c) {
+    if (!c || !c.rows || !c.rows.length) return "";
+    var rows = c.rows.map(function (r) {
+      var cls = "ev-row" + (r.verdict === "skip" || r.verdict === "after" ? " dim" : "");
+      var va = "v a" + (r.verdict === "a" ? " win" : (r.verdict === "b" ? " lose" : ""));
+      var vb = "v" + (r.verdict === "b" ? " win" : (r.verdict === "a" ? " lose" : ""));
+      var tag = r.verdict === "a" ? "◀" : (r.verdict === "b" ? "▶" : (r.verdict === "tie" ? "=" : "·"));
+      return '<div class="' + cls + '" title="' + esc(r.reason || "") + '">' +
+        '<span class="k">' + esc(DIM_NAME[r.key] || r.key) + "</span>" +
+        '<span class="' + va + '">' + esc(r.a) + "</span>" +
+        '<span class="tag">' + tag + "</span>" +
+        '<span class="' + vb + '">' + esc(r.b) + "</span></div>";
+    }).join("");
+    var decided = c.decided_by ? (DIM_NAME[c.decided_by] || c.decided_by) : "全部打平";
+    var verdict = c.result > 0 ? "分享更优" : (c.result < 0 ? "转存更优" : "打平");
+    return '<details class="ev"><summary>' + icon("scale") + "逐维对比" +
+      (c.episode ? "（E" + String(c.episode).padStart(2, "0") + " 代表集）" : "") +
+      '<span class="ev-by">' + esc(decided) + "</span></summary>" +
+      '<div class="ev-body">' +
+        '<div class="ev-head"><span class="k">维度</span>' +
+          '<span class="v a">分享 · ' + esc(shortName(c.share_name)) + "</span>" +
+          '<span class="tag"></span>' +
+          '<span class="v">' + esc(shortName(c.local_name)) + " · 转存</span></div>" +
+        rows +
+        '<div class="ev-note">结论：' + esc(verdict) +
+          (c.decided_by ? "（决胜维度：" + esc(decided) + "）" : "") +
+          '；「·」为已关闭或未识别而跳过的维度</div>' +
+      "</div></details>";
+  }
+
   function actCard(a, i) {
     var loc = a.season ? "S" + String(a.season).padStart(2, "0") : "";
     if (a.ep) loc += "E" + String(a.ep).padStart(2, "0");
     var drops = a.drop_detail || (a.drop || []).map(function (n) { return { name: n, summary: "" }; });
     var keepLine = a.keep_summary ? '<div class="reason">择优依据：' + esc(a.keep_summary) + "</div>" : "";
+    var scopeLine = a.scope === "cross" ? '<span class="pill brand">双库精简</span>' : "";
+    var sideLine = a.side === "shr" ? "淘汰分享库" : (a.side === "loc" ? "淘汰转存库" : "");
+    var reasonLine = a.reason_label ? '<div class="reason">' + esc(a.reason_label) + "</div>" : "";
+    var subs = a.subs || [];
+    var subsLine = subs.length
+      ? '<div class="reason">随删同名字幕 ' + subs.length + " 个：" +
+        esc(subs.map(function (p) { return String(p).split("/").pop(); }).join("、")) + "</div>"
+      : "";
     return '<div class="act"><div class="head">' +
         "<b>" + esc(a.name) + "</b>" +
         (loc ? '<span class="pill plain">' + esc(loc) + "</span>" : "") +
         '<span class="pill plain">' + esc(a.cat || "未分类") + "</span>" +
+        scopeLine + (sideLine ? '<span class="pill warn">' + sideLine + "</span>" : "") +
         '<span class="conf ' + esc(a.confidence || "weak") + '">' +
           esc(CONF_NAME[a.confidence] || a.confidence || "—") + "</span>" +
         '<span class="hint" style="margin-left:auto">' + drops.length + " 个版本 → 保留 1</span>" +
@@ -495,7 +574,8 @@
             return "<li>" + esc(x.name) + (x.summary ? "<br><span class='dim'>" + esc(x.summary) + "</span>" : "") + "</li>";
           }).join("") + "</ul></div>" +
       "</div>" +
-      (a.reason ? '<div class="reason">' + esc(a.reason) + "</div>" : "") +
+      compareBlock(a.compare) + subsLine +
+      reasonLine + (a.reason ? '<div class="reason">' + esc(a.reason) + "</div>" : "") +
       "</div>";
   }
 
@@ -835,3 +915,4 @@
     return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
   };
 })();
+

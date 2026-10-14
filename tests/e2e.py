@@ -79,6 +79,9 @@ def wait_task(op, port, tid, timeout=120):
 def main():
     env_paths = _common.prepare()
     lib = env_paths["lib"]
+    # 双库精简专用：分享侧 4K / 转存侧 1080p（含 .zh.srt）。
+    # 加在 prepare() 之后，单测的既有计数不受影响。
+    _s_path, _t_path, _t_sub = _common.add_dual_pair(lib)
     port = free_port()
     origin = f"http://127.0.0.1:{port}"
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -156,6 +159,30 @@ def main():
         check("无指纹不一致", pv.get("mismatch") == [])
         check("无保留版缺失", pv.get("keep_missing") == [])
 
+        print("\n== 4b. 双库精简 ==")
+        check("策略含平局档 skip", (d.get("strategy") or {}).get("tie_keep") == "skip",
+              str((d.get("strategy") or {}).get("tie_keep")))
+        dual = [a for a in d["actions"] if a.get("scope") == "cross"]
+        check("计划含 1 个双库动作", len(dual) == 1, f"got {len(dual)}")
+        if dual:
+            a0 = dual[0]
+            check("双库动作淘汰转存侧",
+                  a0.get("side") == "loc" and
+                  all("转存已整理" in p for p in a0["files"]), str(a0.get("side")))
+            check("双库动作带逐维对比证据",
+                  isinstance(a0.get("compare"), dict) and
+                  len(a0["compare"].get("rows") or []) > 0)
+            check("逐维证据含决胜维度", bool(a0["compare"].get("decided_by")),
+                  str(a0["compare"].get("decided_by")))
+            check("同名字幕随删", any(p.endswith(".srt") for p in a0["files"]),
+                  str([p.split("/")[-1] for p in a0["files"]]))
+            check("字幕单列在 subs 里", len(a0.get("subs") or []) == 1 and
+                  (a0["subs"][0] or "").endswith(".zh.srt"), str(a0.get("subs")))
+            # guard 指纹不外泄给前端（只在校验链内部用），所以这里用复核结果反证：
+            # 复核 executable 为真 ⇒ 每个文件（含字幕）都有匹配的指纹快照。
+            check("字幕已纳入复核范围", pv.get("total_files") == files,
+                  f"{pv.get('total_files')} vs {files}")
+
         print("\n== 5. dry-run ==")
         before = _common.snapshot(lib)
         s, r = call(op, port, f"/api/plan/{pid}/execute", "POST", {"dry_run": True},
@@ -188,6 +215,11 @@ def main():
         check("多版本影片只剩最优", len(kept) == 1 and "2160p" in kept[0], str(kept))
         single = [p for p in after if "影片丙 (2019)" in p]
         check("单版本影片未被动", len(single) == 1)
+        check("双库：分享侧保留",
+              any("跨库甲" in p and "分享已整理" in p for p in after))
+        check("双库：转存侧已删（含同名字幕）",
+              not any("跨库甲" in p and "转存已整理" in p for p in after),
+              str([p for p in after if "跨库甲" in p]))
 
         print("\n== 8. 一次性 ==")
         s, r = call(op, port, f"/api/plan/{pid}/execute", "POST",
@@ -220,7 +252,7 @@ def main():
               str((st.get("totals") or {}).get("strms")))
         check("含分类分布", any((sd.get("movie") or sd.get("tv") or {}).get("categories")
                               for sd in sides))
-        check("含治理计数", isinstance(ov.get("summary"), dict) and
+        check("含精简计数", isinstance(ov.get("summary"), dict) and
               "multi_version_movie" in (ov.get("summary") or {}))
         check("含产物新鲜度", isinstance(ov.get("index"), dict) and ov["index"].get("exists") is True)
         check("含计划与审计", isinstance(ov.get("plans"), list) and isinstance(ov.get("audit"), list))

@@ -99,8 +99,40 @@ def build_library(base):
 
 
 def make_config(path, lib, out):
-    _write(path, json.dumps({"share_root": lib, "out_dir": out},
+    # quiet_minutes=0：测试里目录是「刚刚创建」的，默认 15 分钟的入库静默期
+    # 会把所有作品挡掉（那是生产环境的正确行为）。测试要的是立即裁决。
+    _write(path, json.dumps({"share_root": lib, "out_dir": out,
+                             "strategy": {"quiet_minutes": 0}},
                             ensure_ascii=False, indent=2))
+
+
+# 双库精简专用的一对作品：分享侧 4K / 转存侧 1080p（含中文字幕）。
+# 刻意与 MOVIES 里的作品不重名，这样单测的既有计数（分享侧 6 条）不受影响 ——
+# 只有显式调用 add_dual_pair() 的用例（e2e）才会看到它。
+DUAL_TITLE = "跨库甲 (2019) {tmdbid-7001}"
+DUAL_SHARE_FILE = "跨库甲.2019.2160p.WEB-DL.HEVC.DDP5.1.strm"
+DUAL_TC_FILE = "跨库甲.2019.1080p.WEB-DL.H.264.AAC.strm"
+DUAL_TC_SUB = "跨库甲.2019.1080p.WEB-DL.H.264.AAC.zh.srt"
+
+
+def add_dual_pair(lib, title=DUAL_TITLE, share_file=DUAL_SHARE_FILE,
+                  tc_file=DUAL_TC_FILE, tc_sub=DUAL_TC_SUB):
+    """在两边库各放一份同名作品，返回 (分享文件路径, 转存文件路径, 转存字幕路径)。
+
+    分享侧规格明显更高 → 双库精简应判定「淘汰转存侧」，
+    且转存侧那份的 `.zh.srt` 必须跟着一起删（否则留下孤立字幕）。
+    """
+    s_dir = os.path.join(lib, "分享已整理", "电影", "其他电影", title)
+    t_dir = os.path.join(lib, "转存已整理", "电影", "其他电影", title)
+    s_path = os.path.join(s_dir, share_file)
+    t_path = os.path.join(t_dir, tc_file)
+    _write(s_path, SRM_URL + "\n")
+    _write(t_path, SRM_URL + "\n")
+    sub_path = None
+    if tc_sub:
+        sub_path = os.path.join(t_dir, tc_sub)
+        _write(sub_path, "1\n00:00:01,000 --> 00:00:02,000\n测试字幕\n")
+    return s_path, t_path, sub_path
 
 
 def prepare(conf_phrase="删除这些 strm 文件"):

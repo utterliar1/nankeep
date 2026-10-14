@@ -27,5 +27,15 @@
       "release_group": []
     },
     "release_groups": []
+  },
+  "strategy": {
+    "decision": "quality_first",
+    "tie_keep": "skip",
+    "season_replace_ratio": 0.9,
+    "multi_season_protect": "compare",
+    "special_action": "compare",
+    "exempt_keywords": [],
+    "quiet_minutes": 15,
+    "match": "title_year"
   }
 }

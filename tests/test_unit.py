@@ -23,7 +23,7 @@ import nankeep as nk                                        # noqa: E402
 import nankeep_web as W                                     # noqa: E402
 
 
-# ─────────────────── 核心治理逻辑 ───────────────────
+# ─────────────────── 核心精简逻辑 ───────────────────
 
 class TestParseAndQuality(unittest.TestCase):
     def test_movie_file_parse(self):
@@ -184,6 +184,282 @@ class TestGovernanceAnalysis(unittest.TestCase):
         self.assertIn("DRY=1", sh)
         self.assertIn("rm -f --", sh)
         self.assertIn("未删除任何文件", sh)
+
+
+class TestDualLibrarySimplify(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.root = os.path.join(ENV["base"], "dual-lib")
+        cls.out = os.path.join(ENV["base"], "dual-out")
+        os.makedirs(cls.out, exist_ok=True)
+        cls.url = _common.SRM_URL + "\n"
+
+        def add(lib, kind, category, title, filename, season=None):
+            parts = [cls.root, lib, "电影" if kind == nk.KIND_MOVIE else "电视剧", category, title]
+            if season is not None:
+                parts.append(season)
+            path = os.path.join(*parts)
+            os.makedirs(path, exist_ok=True)
+            with open(os.path.join(path, filename), "w", encoding="utf-8") as f:
+                f.write(cls.url)
+
+        # 分享侧更高规格，计划应淘汰转存侧。
+        add(nk.LIB_SHARE, nk.KIND_MOVIE, "电影", "双库甲 (2020) {tmdbid-9001}",
+            "双库甲.2020.2160p.WEB-DL.HEVC.DDP5.1.strm")
+        add(nk.LIB_TRANSCODE, nk.KIND_MOVIE, "电影", "双库甲 (2020) {tmdbid-9001}",
+            "双库甲.2020.1080p.WEB-DL.H.264.AAC.strm")
+        # 转存侧更高规格，计划应淘汰分享侧。
+        add(nk.LIB_SHARE, nk.KIND_MOVIE, "电影", "双库乙 (2021) {tmdbid-9002}",
+            "双库乙.2021.1080p.WEB-DL.H.264.AAC.strm")
+        add(nk.LIB_TRANSCODE, nk.KIND_MOVIE, "电影", "双库乙 (2021) {tmdbid-9002}",
+            "双库乙.2021.2160p.WEB-DL.HEVC.DDP5.1.strm")
+        # 分享侧缺 E02，转存侧完整；不应以画质为由删除完整转存侧。
+        for ep in (1, 2):
+            add(nk.LIB_TRANSCODE, nk.KIND_TV, "剧集", "双库丙 (2022) {tmdbid-9003}",
+                f"双库丙.2022.S01E0{ep}.WEB-DL.1080p.H.264.AAC.strm", "Season 1")
+        add(nk.LIB_SHARE, nk.KIND_TV, "剧集", "双库丙 (2022) {tmdbid-9003}",
+            "双库丙.2022.S01E01.2160p.WEB-DL.HEVC.DDP5.1.strm", "Season 1")
+
+        cfg = nk.load_cfg(ENV["conf"])
+        cfg["share_root"] = cls.root
+        cfg["out_dir"] = cls.out
+        cfg["strategy"]["quiet_minutes"] = 0
+        cls.cfg = cfg
+        cls.scans = nk._run_scan(cfg, cls.root,
+                                 [("share", nk.LIB_SHARE), ("transcode", nk.LIB_TRANSCODE)],
+                                 cls.out, log=lambda *a: None, use_cache=False)
+
+    def test_movie_share_wins_deletes_transcode(self):
+        actions, _ = nk.analyze_dual(self.scans, self.cfg, with_guard=False)
+        action = next(a for a in actions if "双库甲" in a["name"])
+        self.assertEqual(action["side"], nk.SIDE_LOC)
+        self.assertTrue(all(nk.LIB_TRANSCODE in p for p in action["files"]))
+        self.assertEqual(action["scope"], "cross")
+
+    def test_movie_local_wins_deletes_share(self):
+        actions, _ = nk.analyze_dual(self.scans, self.cfg, with_guard=False)
+        action = next(a for a in actions if "双库乙" in a["name"])
+        self.assertEqual(action["side"], nk.SIDE_SHR)
+        self.assertTrue(all(nk.LIB_SHARE in p for p in action["files"]))
+
+    def test_incomplete_share_does_not_delete_complete_local(self):
+        actions, _ = nk.analyze_dual(self.scans, self.cfg, with_guard=False)
+        actions = [a for a in actions if "双库丙" in a["name"]]
+        self.assertTrue(actions)
+        self.assertTrue(all(a["side"] == nk.SIDE_SHR for a in actions))
+        self.assertTrue(all(all(nk.LIB_SHARE in p for p in a["files"]) for a in actions))
+
+    def test_no_file_appears_in_two_actions(self):
+        """同一文件被两个动作重复认领 → 第二个删除必然失败，计划不可执行。"""
+        actions, _ = nk.analyze_dual(self.scans, self.cfg, with_guard=True)
+        seen = {}
+        for a in actions:
+            for p in a["files"]:
+                self.assertNotIn(p, seen, f"{p} 同时出现在两个动作里：{seen.get(p)} / {a['name']}")
+                seen[p] = a["name"]
+
+
+class _DualFixture(unittest.TestCase):
+    """双库用例的公共夹具：按 (库, 分类, 标题, 文件名[, 字幕]) 造目录。"""
+
+    suite_name = "dual-case"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = os.path.join(ENV["base"], cls.suite_name)
+        cls.out = os.path.join(ENV["base"], cls.suite_name + "-out")
+        os.makedirs(cls.out, exist_ok=True)
+        cls.build()
+        cfg = nk.load_cfg(ENV["conf"])
+        cfg["share_root"] = cls.root
+        cfg["out_dir"] = cls.out
+        cfg["strategy"]["quiet_minutes"] = 0
+        cls.cfg = cfg
+        cls.scans = nk._run_scan(cfg, cls.root,
+                                 [("share", nk.LIB_SHARE), ("transcode", nk.LIB_TRANSCODE)],
+                                 cls.out, log=lambda *a: None, use_cache=False)
+
+    @classmethod
+    def add(cls, lib, cat, title, filename, subs=()):
+        d = os.path.join(cls.root, lib, "电影", cat, title)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, filename), "w", encoding="utf-8", newline="\n") as f:
+            f.write(_common.SRM_URL + "\n")
+        for s in subs:
+            with open(os.path.join(d, s), "w", encoding="utf-8", newline="\n") as f:
+                f.write("1\n00:00:01,000 --> 00:00:02,000\n字幕\n")
+
+    @classmethod
+    def build(cls):
+        raise NotImplementedError
+
+    def actions(self, **strat):
+        cfg = dict(self.cfg)
+        cfg["strategy"] = dict(cfg["strategy"])
+        cfg["strategy"].update(strat)
+        return nk.analyze_dual(self.scans, cfg, with_guard=False)[0]
+
+
+class TestTieKeep(_DualFixture):
+    """平局档：规格读不出来时，绝不能默认「删转存」。"""
+
+    suite_name = "tie-lib"
+
+    @classmethod
+    def build(cls):
+        # ① 两边规格一字不差 → 九维全平
+        f = "平局甲.2020.1080p.WEB-DL.H.264.AAC.strm"
+        cls.add(nk.LIB_SHARE, "其他电影", "平局甲 (2020) {tmdbid-8101}", f)
+        cls.add(nk.LIB_TRANSCODE, "其他电影", "平局甲 (2020) {tmdbid-8101}", f)
+        # ② 分享侧规格完全读不出、转存侧明确的 4K —— 历史回归：曾判「删转存」
+        cls.add(nk.LIB_SHARE, "其他电影", "平局乙 (2021) {tmdbid-8102}", "平局乙.2021.xx.strm")
+        cls.add(nk.LIB_TRANSCODE, "其他电影", "平局乙 (2021) {tmdbid-8102}",
+                 "平局乙.2021.2160p.WEB-DL.HEVC.DDP5.1.strm")
+
+    def test_default_tie_keep_is_skip(self):
+        self.assertEqual(nk._strategy({})["tie_keep"], "skip")
+
+    def test_legacy_bool_tie_keep_local_still_honored(self):
+        self.assertEqual(nk._strategy({"strategy": {"tie_keep_local": True}})["tie_keep"], "local")
+        self.assertEqual(nk._strategy({"strategy": {"tie_keep_local": False}})["tie_keep"], "share")
+        self.assertNotIn("tie_keep_local",
+                         nk._strategy({"strategy": {"tie_keep_local": True}}))
+
+    def test_exact_tie_makes_no_action(self):
+        self.assertEqual([a for a in self.actions() if "平局甲" in a["name"]], [])
+
+    def test_unreadable_share_spec_makes_no_action(self):
+        """核心回归：分享侧规格读不出 + 转存侧明确 4K，默认档什么都不删。"""
+        self.assertEqual([a for a in self.actions() if "平局乙" in a["name"]], [])
+
+    def test_tie_keep_share_deletes_transcode(self):
+        a = next(a for a in self.actions(tie_keep="share") if "平局甲" in a["name"])
+        self.assertEqual(a["side"], nk.SIDE_LOC)
+        self.assertTrue(all(nk.LIB_TRANSCODE in p for p in a["files"]))
+
+    def test_tie_keep_local_deletes_share(self):
+        a = next(a for a in self.actions(tie_keep="local") if "平局甲" in a["name"])
+        self.assertEqual(a["side"], nk.SIDE_SHR)
+        self.assertTrue(all(nk.LIB_SHARE in p for p in a["files"]))
+
+    def test_explicit_decision_overrides_tie(self):
+        for decision, side in (("keep_share", nk.SIDE_LOC), ("keep_local", nk.SIDE_SHR)):
+            a = next(a for a in self.actions(decision=decision) if "平局甲" in a["name"])
+            self.assertEqual(a["side"], side)
+
+    def test_tie_counter_reported(self):
+        _acts, stats = nk.analyze_dual(self.scans, self.cfg, with_guard=False)
+        self.assertGreaterEqual(stats["tie"], 2)
+
+
+class TestDualDedupe(_DualFixture):
+    """分享侧同身份重复：只认领一次，绝不产生两个动作。"""
+
+    suite_name = "dedupe-lib"
+
+    @classmethod
+    def build(cls):
+        # 同一 identity 出现在两个分类目录下（库内自身重复）
+        cls.add(nk.LIB_SHARE, "其他电影", "重复甲 (2020) {tmdbid-8201}",
+                "重复甲.2020.2160p.WEB-DL.HEVC.DDP5.1.strm")
+        cls.add(nk.LIB_SHARE, "动画电影", "重复甲 (2020) {tmdbid-8201}",
+                "重复甲.2020.1080p.WEB-DL.H.264.AAC.strm")
+        cls.add(nk.LIB_TRANSCODE, "其他电影", "重复甲 (2020) {tmdbid-8201}",
+                "重复甲.2020.1080p.WEB-DL.H.264.AAC.strm")
+
+    def test_only_one_action_and_no_overlap(self):
+        actions = self.actions()
+        hits = [a for a in actions if "重复甲" in a["name"]]
+        self.assertEqual(len(hits), 1, str([a["files"] for a in hits]))
+        seen = set()
+        for a in actions:
+            for p in a["files"]:
+                self.assertNotIn(p, seen)
+                seen.add(p)
+
+    def test_dup_counter_reported(self):
+        _acts, stats = nk.analyze_dual(self.scans, self.cfg, with_guard=False)
+        self.assertGreaterEqual(stats["dup"], 1)
+
+
+class TestSubsFollowDelete(_DualFixture):
+    """删 strm 时同名字幕必须跟删；与保留版共享的字幕不能误删。"""
+
+    suite_name = "subs-lib"
+
+    @classmethod
+    def build(cls):
+        d = os.path.join(cls.root, nk.LIB_SHARE, "电影", "其他电影",
+                         "字幕甲 (2020) {tmdbid-8301}")
+        os.makedirs(d, exist_ok=True)
+        for name in ("字幕甲.2020.1080p.WEB-DL.H.264.AAC.strm",
+                     "字幕甲.2020.2160p.WEB-DL.HEVC.DDP5.1.strm",
+                     "字幕甲.2020.1080p.WEB-DL.H.264.AAC.zh.srt",
+                     "字幕甲.2020.2160p.WEB-DL.HEVC.DDP5.1.eng.srt"):
+            with open(os.path.join(d, name), "w", encoding="utf-8", newline="\n") as f:
+                f.write(_common.SRM_URL + "\n")
+
+    def setUp(self):
+        self.idx = nk.analyze_all(self.scans, self.cfg)
+
+    def test_sub_of_dropped_version_is_deleted_too(self):
+        plan = nk.build_plan(self.idx, nk.KIND_MOVIE, self.cfg)
+        act = next(a for a in plan["actions"] if "字幕甲" in a["name"])
+        base = [p for p in act["files"] if p.endswith(".strm")]
+        self.assertEqual(len(base), 1)
+        self.assertIn("1080p", base[0])                       # 保留 4K、删 1080p
+        self.assertTrue(any(p.endswith("AAC.zh.srt") for p in act["files"]),
+                        str(act["files"]))
+        self.assertFalse(any(p.endswith("HEVC.DDP5.1.eng.srt") for p in act["files"]),
+                         "保留版自己的字幕不能被误删")
+        self.assertEqual(len(act["subs"]), 1)
+        self.assertTrue(all(p in act["guard"] for p in act["files"]),
+                        "字幕也要有指纹快照，否则复核阶段会因「不可校验」整体中止")
+
+    def test_validate_plan_accepts_sub_files(self):
+        plan = nk.build_plan(self.idx, nk.KIND_MOVIE, self.cfg)
+        self.assertEqual(nk.validate_plan(plan), [])
+
+    def test_sibling_subs_helper(self):
+        d = os.path.join(self.root, nk.LIB_SHARE, "电影", "其他电影",
+                         "字幕甲 (2020) {tmdbid-8301}")
+        got = nk._sibling_subs(os.path.join(d, "字幕甲.2020.1080p.WEB-DL.H.264.AAC.strm"))
+        self.assertEqual([os.path.basename(p) for p in got],
+                         ["字幕甲.2020.1080p.WEB-DL.H.264.AAC.zh.srt"])
+
+
+class TestMatchEntry(unittest.TestCase):
+    """tmdb_first 配对必须校验年份并拒绝歧义，否则会跨片删错。"""
+
+    def _entry(self, title, year, tmdb, path):
+        return {"identity": f"{title} ({year})", "name": title,
+                "meta": {"title": title, "year": year, "tmdb": tmdb, "ok": True},
+                "dir": path, "strms": [], "subs": [], "seasons": []}
+
+    def test_tmdb_requires_matching_year(self):
+        share = self._entry("甲", "2020", "900", "/s/甲")
+        other = self._entry("乙", "1998", "900", "/t/乙")     # 同 tmdb、年份不同 → 重拍/串号
+        idx = {"乙 (1998)": other}
+        self.assertEqual(nk._match_entry(share, idx, {"match": "tmdb_first"}), (None, "none"))
+
+    def test_tmdb_unique_hit_matches(self):
+        share = self._entry("甲", "2020", "900", "/s/甲")
+        hit = self._entry("甲 译名", "2020", "900", "/t/甲")
+        idx = {"甲 (2020)": hit}
+        self.assertEqual(nk._match_entry(share, idx, {"match": "tmdb_first"}), (hit, "tmdb"))
+
+    def test_tmdb_ambiguous_falls_back_to_identity(self):
+        share = self._entry("甲", "2020", "900", "/s/甲")
+        a = self._entry("甲", "2020", "900", "/t/a")
+        b = self._entry("甲", "2020", "900", "/t/b")
+        idx = {"甲 (2020)": a, "甲 (2020)#2": b}
+        self.assertEqual(nk._match_entry(share, idx, {"match": "tmdb_first"}), (a, "identity"))
+
+    def test_title_year_mode_ignores_tmdb(self):
+        share = self._entry("甲", "2020", "900", "/s/甲")
+        hit = self._entry("甲", "2020", "999", "/t/甲")
+        self.assertEqual(nk._match_entry(share, {"甲 (2020)": hit}, {"match": "title_year"}),
+                         (hit, "identity"))
 
 
 # ─────────────────── Web 层安全与守卫 ───────────────────
@@ -410,7 +686,7 @@ class TestRenderMd(unittest.TestCase):
 
 
 class TestOverviewAggregation(unittest.TestCase):
-    """总览页的数据源：_build_stats（规模/分布）与 _summary_counts（治理计数）。"""
+    """总览页的数据源：_build_stats（规模/分布）与 _summary_counts（精简计数）。"""
 
     @classmethod
     def setUpClass(cls):

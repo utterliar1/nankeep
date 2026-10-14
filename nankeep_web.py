@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""nankeep web —— NanShare strm 库治理的常驻 Web 层（stdlib only）。
+"""nankeep web —— NanShare strm 库精简的常驻 Web 层（stdlib only）。
 
 设计信条（照抄 StrimKeep 的删除模型）：**干得快 != 敢删；宁可漏删、绝不误删。**
 
@@ -251,7 +251,7 @@ class mutation_lock:
         os.makedirs(DATA_DIR, exist_ok=True)
         if fcntl is None:
             if not mutation_lock._fallback.acquire(blocking=False):
-                raise MutationBusy("已有治理任务正在执行，请稍后再试")
+                raise MutationBusy("已有精简任务正在执行，请稍后再试")
             return self
         self._fh = open(LOCK_FILE, "w")
         try:
@@ -259,7 +259,7 @@ class mutation_lock:
         except OSError:
             self._fh.close()
             self._fh = None
-            raise MutationBusy("已有治理任务正在执行，请稍后再试")
+            raise MutationBusy("已有精简任务正在执行，请稍后再试")
         return self
 
     def __exit__(self, *exc):
@@ -432,7 +432,7 @@ def csrf_blocked(method, headers, has_cookie):
     return _host_of(origin) not in allowed
 
 
-# ─────────────────────────── 治理业务 ───────────────────────────
+# ─────────────────────────── 精简业务 ───────────────────────────
 
 def load_cfg():
     cfg = nk.load_cfg(CONFIG_PATH)
@@ -443,9 +443,10 @@ def load_cfg():
 
 
 def rule_sig(cfg):
-    """配置指纹：unknown/order/enabled/tiers/release_groups 任一变化都让旧计划作废。"""
+    """画质或双库精简策略变化时，让旧计划作废。"""
     sub = {k: cfg.get(k) for k in
-           ("unknown", "order", "enabled", "tiers", "release_groups")}
+           ("unknown", "order", "enabled", "tiers", "release_groups",
+            "strategy")}
     blob = json.dumps(sub, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
@@ -514,7 +515,7 @@ def _build_stats(scans):
 
 
 def _summary_counts(idx):
-    """治理结论计数（报告页与总览页共用）。"""
+    """精简结论计数（报告页与总览页共用）。"""
     mv = idx["multi_version"]
     conf = {}
     for m in mv:
@@ -522,6 +523,9 @@ def _summary_counts(idx):
         conf[k] = conf.get(k, 0) + 1
     missing = idx["missing"]
     cross = idx["cross"]
+    dual = idx.get("dual") or {}
+    dual_stats = dual.get("stats") or {}
+    dual_actions = [a for a in dual.get("actions") or [] if a.get("files")]
     return {
         "multi_version_movie": sum(1 for m in mv if m["kind_family"] == nk.KIND_MOVIE),
         "multi_version_tv": sum(1 for m in mv if m["kind_family"] == nk.KIND_TV),
@@ -535,6 +539,14 @@ def _summary_counts(idx):
         "cross_only_share": len(cross["only_share"]),
         "cross_share_total": cross["share_total"],
         "cross_tc_total": cross["tc_total"],
+        "dual_actions": len(dual_actions),
+        "dual_files": sum(len(a.get("files") or []) for a in dual_actions),
+        "dual_subs": sum(len(a.get("subs") or []) for a in dual_actions),
+        "dual_exempt": dual_stats.get("exempt", 0),
+        "dual_quiet": dual_stats.get("quiet", 0),
+        "dual_unmatched": dual_stats.get("no_match", 0),
+        "dual_tie": dual_stats.get("tie", 0),
+        "dual_dup": dual_stats.get("dup", 0),
         "errors": len(idx["errors"]),
     }
 
@@ -655,12 +667,17 @@ def check_keep_alive(plan, task):
     """
     ok, bad = [], []
     for a in plan["actions"]:
-        kp = a.get("keep_path")
-        if kp and nk._fingerprint(kp) is not None:
+        paths = list(a.get("keep_paths") or [])
+        if not paths and a.get("keep_path"):
+            paths = [a.get("keep_path")]
+        missing = [p for p in paths if nk._fingerprint(p) is None]
+        if paths and not missing:
             ok.append(a)
         else:
             bad.append({"name": a.get("name"), "keep": a.get("keep"),
-                        "keep_path": kp, "reason": "保留版不存在或不可校验"})
+                        "keep_path": a.get("keep_path"),
+                        "keep_paths": paths, "missing": missing,
+                        "reason": "保留版不存在或不可校验"})
     for b in bad:
         task.emit(f"跳过 [{b['name']}]：{b['reason']}")
     return ok, bad
@@ -1047,12 +1064,13 @@ def r_status(h, q):
         "plan_ttl_min": PLAN_TTL_MIN, "confirm_phrase": CONFIRM_PHRASE,
         "rule_sig": rule_sig(cfg),
         "quality": {k: cfg.get(k) for k in ("unknown", "order", "enabled")},
+        "strategy": cfg.get("strategy") or {},
         "busy": TASKS.busy(), "writable": _writable_check(),
     })
 
 
 def r_overview(h, q):
-    """总览页一次拿全：规模/分布 + 治理计数 + 计划 + 最近审计 + 运行状态。
+    """总览页一次拿全：规模/分布 + 精简计数 + 计划 + 最近审计 + 运行状态。
 
     刻意做成单接口：前端只轮询这一条，避免 NAS 上并发一堆小请求。
     """
@@ -1075,6 +1093,7 @@ def r_overview(h, q):
         "plan_ttl_min": PLAN_TTL_MIN, "confirm_phrase": CONFIRM_PHRASE,
         "rule_sig": rule_sig(cfg),
         "quality": {k: cfg.get(k) for k in ("unknown", "order", "enabled")},
+        "strategy": cfg.get("strategy") or {},
         "catalog": {"movie": nk.KIND_MOVIE, "tv": nk.KIND_TV},
     })
 
@@ -1109,15 +1128,22 @@ def r_plan_detail(h, q, pid):
         return h._err(404, "计划不存在")
     plan = STORE.plan_payload(pid)
     actions = [{
+        "scope": a.get("scope") or "local",
+        "side": a.get("side"),
         "dir": a.get("dir"), "name": a.get("name"), "cat": a.get("cat"),
         "season": a.get("season"), "ep": a.get("ep"), "keep": a.get("keep"),
-        "keep_ok": nk._fingerprint(a.get("keep_path")) is not None,
+        "keep_paths": a.get("keep_paths") or ([a.get("keep_path")] if a.get("keep_path") else []),
+        "keep_ok": all(nk._fingerprint(p) is not None for p in
+                          (a.get("keep_paths") or ([a.get("keep_path")] if a.get("keep_path") else []))),
         "keep_summary": a.get("keep_summary") or "",
         "versions": a.get("versions") or (len(a.get("drop") or []) + 1),
         "drop": a.get("drop", []), "drop_detail": a.get("drop_detail") or [],
         "files": a.get("files", []),
+        "subs": a.get("subs") or [],
         "confidence": a.get("confidence"), "decided_by": a.get("decided_by"),
         "reason": a.get("reason"),
+        "reason_label": a.get("reason_label") or "",
+        "compare": a.get("compare"),
     } for a in plan.get("actions", [])]
     h._json({"status": "ok", "id": pid, "kind": rec["kind"], "state": rec["state"],
              "created": rec["created"], "expires": rec["expires"],
@@ -1135,10 +1161,14 @@ def r_plan_preview(h, q, pid):
     if err:
         return h._json({"status": "rejected", "message": err})
     bad = nk.validate_plan(plan)
-    keep_bad = [{"name": a.get("name"), "keep": a.get("keep"),
-                 "keep_path": a.get("keep_path")}
-                for a in plan["actions"] if not nk._fingerprint(a.get("keep_path"))]
-    h._json({"status": "ok", "executable": not bad,
+    keep_bad = []
+    for a in plan["actions"]:
+        paths = a.get("keep_paths") or ([a.get("keep_path")] if a.get("keep_path") else [])
+        missing = [p for p in paths if nk._fingerprint(p) is None]
+        if not paths or missing:
+            keep_bad.append({"name": a.get("name"), "keep": a.get("keep"),
+                             "keep_path": a.get("keep_path"), "missing": missing})
+    h._json({"status": "ok", "executable": not bad and not keep_bad,
              "total_files": sum(len(a.get("files", [])) for a in plan["actions"]),
              "titles": len(plan["actions"]), "mismatch": bad[:200],
              "keep_missing": keep_bad, "confirm_phrase": CONFIRM_PHRASE})
@@ -1328,3 +1358,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+

@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-nankeep —— NanShare strm 库治理工具（只读优先）
+nankeep —— NanShare strm 库精简工具（只读优先）
 
 针对 NanShare 输出的 `<库根>/分享已整理` 与 `<库根>/转存已整理` 双库：
 
     scan    扫描两库，解析片名/年份/tmdbid/季集/规格，落结构化索引
-    report  生成治理报告（多版本择优、逐集混版本、缺集、命名异常、孤立字幕、跨库对照）
-    plan    生成可审阅的治理计划（含文件身份指纹，TOCTOU 复核用）
+    report  生成精简报告（多版本择优、逐集混版本、缺集、命名异常、孤立字幕、跨库对照）
+    plan    生成可审阅的精简计划（含文件身份指纹，TOCTOU 复核用）
     apply   按计划执行前重新指纹复核；默认 dry-run，可 --emit-sh 输出待执行脚本
 
 设计约束（本项目约定）：
   * 默认只读，绝不写 NAS；apply 必须显式 --yes 才可能产生写入
   * 给 NAS 拼路径禁用 os.path.join → 一律 f-string 手拼 '/'，避免 Windows 反斜杠
   * stdlib only，无第三方依赖；脚本 LF、UTF-8
-  * 治理身份 = 目录的「片名 + 年份」；tmdbid 仅作辅助（防错误 tmdbid 把 A 与 B 合并）
+  * 精简身份 = 目录的「片名 + 年份」；tmdbid 仅作辅助（防错误 tmdbid 把 A 与 B 合并）
 
 用法示例：
   python nankeep.py scan
@@ -37,6 +37,8 @@ import sys
 import time
 from collections import defaultdict
 
+import nankeep_domain as dom
+
 # ─────────────────────────── 常量 ───────────────────────────
 
 # 默认库根只是占位示例 —— 实际用 --root、环境变量 NANKEEP_ROOT 或配置文件覆盖。
@@ -49,6 +51,7 @@ KIND_TV = "tv"
 
 VIDEO_EXTS = (".strm",)
 SUB_EXTS = (".srt", ".ass", ".ssa", ".sub", ".idx", ".sup", ".vtt")
+ALL_EXTS = VIDEO_EXTS + SUB_EXTS
 ART_NAMES = {"poster.jpg", "fanart.jpg", "clearlogo.png", "logo.png", "banner.jpg",
              "thumb.jpg", "landscape.jpg", "disc.jpg", "backdrop.jpg", "folder.jpg"}
 IGNORE_SUFFIXES = ("-thumb.jpg", "-thumb.png")
@@ -760,7 +763,7 @@ def build_report(idx: dict, scans: dict, top: int, cfg: dict) -> str:
     A = L.append
     share = scans.get("share", [])
     tc = scans.get("transcode", [])
-    A("# NanShare strm 库治理报告")
+    A("# NanShare strm 库精简报告")
     A("")
     A(f"- 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
     A(f"- 库根：`{idx['root']}`")
@@ -842,8 +845,25 @@ def build_report(idx: dict, scans: dict, top: int, cfg: dict) -> str:
                        [[i["kind"], i["identity"], i["dir"]] for i in x["only_transcode"]],
                        limit=top or None)
         A("")
+    dual = idx.get("dual") or {}
+    dual_actions = [a for a in dual.get("actions") or [] if a.get("files")]
+    dual_stats = dual.get("stats") or {}
+    A("## 8. 双库精简建议")
+    A("")
+    A(f"- 可处理动作：**{len(dual_actions)}** 条，待删 **{sum(len(a.get('files') or []) for a in dual_actions)}** 个 strm")
+    A(f"- 白名单豁免：**{dual_stats.get('exempt', 0)}** 部；静默期跳过：**{dual_stats.get('quiet', 0)}** 部；未配对：**{dual_stats.get('no_match', 0)}** 部")
+    A("")
+    rows = []
+    for a in dual_actions:
+        side = SIDE_LABEL.get(a.get("side"), "两侧")
+        loc = f"S{a['season']:02d}" if a.get("season") is not None else "电影"
+        rows.append([a.get("cat") or "未分类", loc, a.get("name") or "",
+                     side, a.get("reason_label") or a.get("reason") or "",
+                     len(a.get("files") or [])])
+    L += _md_table(["分类", "位置", "作品", "淘汰侧", "依据", "文件数"],
+                   rows, limit=top or None)
     if idx["errors"]:
-        A("## 8. 扫描错误")
+        A("## 9. 扫描错误")
         A("")
         L += _md_table(["路径", "错误"], [[e["path"], e["error"]] for e in idx["errors"]],
                        limit=top or None)
@@ -865,13 +885,636 @@ def _fmt_nums(nums: list) -> str:
     return ",".join(out)
 
 
+# ═══════════════════════ 双库精简（跨库对照） ═══════════════════════
+#
+# 与「库内多版本去重」不同，这里处理的是**两库之间**的同一部作品：
+# 按「片名 + 年份」（或 tmdb 优先）配对，逐维比画质，决定保留哪一边、淘汰哪一边。
+# 规则移植自 StrimKeep 的 domain/governance.py（MIT，见 README 致谢），按 NanShare 口径调整：
+#   * 分享侧 = 分享已整理（主），转存侧 = 转存已整理（镜像）
+#   * 「未识别」默认视为打平（保守）——不会因为命名更啰嗦就判它更优
+#   * 残次品（缺前序 / 中间断层）优先淘汰，且独立于画质方向
+#   * 单边独有的作品是补充，不动
+
+SIDE_SHR = "shr"
+SIDE_LOC = "loc"
+SIDE_LABEL = {SIDE_SHR: LIB_SHARE, SIDE_LOC: LIB_TRANSCODE}
+
+STRATEGY_DEFAULT = {
+    "decision": "quality_first",        # quality_first | keep_local | keep_share
+    "tie_keep": "skip",                 # 各维全平时怎么办：skip（不动，默认）| local | share
+    "season_replace_ratio": 0.9,        # 剧集分享达标率阈值（0.5~1.0）
+    "multi_season_protect": "compare",  # off | compare
+    "special_action": "compare",        # compare | ignore | delete
+    "exempt_keywords": [],              # 白名单：命中即不精简
+    "quiet_minutes": 15,                # 入库静默期（分钟），0 = 关闭
+    "match": "title_year",              # title_year | tmdb_first
+}
+
+
+def _tie_keep(st: dict) -> str:
+    """平局档：优先 tie_keep；为兼容老配置仍认 tie_keep_local 布尔。
+
+    注意：tie_keep_local 的语义是「打平就保留本地、删分享」，
+    与新的默认（skip = 谁都不删）不同 —— 所以只在显式存在时才生效。
+    """
+    v = st.get("tie_keep")
+    if v in dom.TIE_CHOICES:
+        return v
+    if "tie_keep_local" in st:
+        return "local" if st.get("tie_keep_local") else "share"
+    return STRATEGY_DEFAULT["tie_keep"]
+
+
+def _clamp_ratio(v) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return STRATEGY_DEFAULT["season_replace_ratio"]
+    return f if 0.5 <= f <= 1.0 else STRATEGY_DEFAULT["season_replace_ratio"]
+
+
+def _strategy(cfg: dict) -> dict:
+    user = dict(cfg.get("strategy") or {})
+    st = dict(STRATEGY_DEFAULT)
+    st.update(user)
+    st["tie_keep"] = _tie_keep(user)
+    st.pop("tie_keep_local", None)      # 归一化后不再外泄，避免两套语义并存
+    return st
+
+
+def _cmp_specs(a_spec, b_spec, cfg) -> int:
+    """按九维规则比较两个规格段：1 = a 优 / -1 = b 优 / 0 = 平。"""
+    return compare(a_spec or "", b_spec or "", cfg)[0]
+
+
+def _best_strm(strms: list, cfg) -> dict | None:
+    if not strms:
+        return None
+    best = strms[0]
+    for s in strms[1:]:
+        if _cmp_specs(s.get("spec"), best.get("spec"), cfg) > 0:
+            best = s
+    return best
+
+
+def _name_cmp(strms: list, cfg):
+    """按文件名比较（供 domain 的纯函数注入）：返回 (cmp, spec_of)。"""
+    spec_of = {}
+    for s in strms:
+        spec_of[s["name"]] = s.get("spec") or ""
+
+    def cmp(a_name, b_name):
+        return _cmp_specs(spec_of.get(a_name), spec_of.get(b_name), cfg)
+    return cmp, spec_of
+
+
+def _compare_meta(s_name, l_name, cfg, spec_of) -> dict:
+    """逐维对比证据（挂到动作上供界面展示）。"""
+    r, by, rows = compare(spec_of.get(s_name, ""), spec_of.get(l_name, ""), cfg)
+    return {"share_name": s_name, "local_name": l_name, "result": r,
+            "decided_by": by, "rows": rows}
+
+
+def _season_cmp(s_strms, l_strms, cfg, tie_keep) -> dict:
+    """同一季逐集对齐比较（domain.season_compare 的 IO 包装）。"""
+    spec_of = {}
+    for s in list(s_strms or []) + list(l_strms or []):
+        spec_of[s["name"]] = s.get("spec") or ""
+
+    def cmp(a_name, b_name):
+        return _cmp_specs(spec_of.get(a_name), spec_of.get(b_name), cfg)
+    return dom.season_compare(
+        s_strms, l_strms, name_of=lambda s: s["name"], ep_of=_ep_of_strm,
+        cmp=cmp, tie_keep=tie_keep,
+        compare_meta=lambda a, b: _compare_meta(a, b, cfg, spec_of))
+
+
+def _ep_of_strm(s: dict):
+    """strm 的（季，集）；无集号返回 None。文件名季号优先，缺则回落到目录季号。"""
+    if s.get("ep") is None:
+        return None
+    return (s.get("file_season") or s.get("season") or 0, s["ep"])
+
+
+def _side_gap_desc(keys) -> str:
+    """某侧缺集描述，如「中间断层 (缺 E03)」；完整返回「完整」。"""
+    ks = sorted({k for k in keys if k > 0})
+    if not ks:
+        return "空"
+    lo, hi = ks[0], ks[-1]
+    pre = list(range(1, lo)) if lo > 1 else []
+    mid = sorted(set(range(lo, hi + 1)) - set(ks))
+    if not pre and not mid:
+        return "完整"
+    parts = []
+    if pre:
+        parts.append(f"缺失前序 (缺 {_fmt_nums(pre)})")
+    if mid:
+        parts.append(f"中间断层 (缺 {_fmt_nums(mid)})")
+    return " 且 ".join(parts)
+
+
+def _make_quiet_gate(minutes):
+    """入库静默期：目录在 N 分钟内有变更 → 整部作品本次不动。"""
+    try:
+        limit = float(minutes) * 60.0
+    except (TypeError, ValueError):
+        limit = 0.0
+    if limit <= 0:
+        return lambda dirs: False
+
+    def skip(dirs):
+        now = time.time()
+        for d in dirs or []:
+            if not d:
+                continue
+            try:
+                if now - os.stat(d).st_mtime < limit:
+                    return True
+            except OSError:
+                continue
+        return False
+    return skip
+
+
+def _exempt_hits(entry: dict, kws: list) -> list:
+    """白名单命中：先看作品名，再看目录/文件路径。"""
+    if not kws:
+        return []
+    hits = dom.exempt_hit(entry.get("name") or "", kws)
+    if hits:
+        return hits
+    paths = [entry.get("dir") or ""]
+    for s in entry.get("strms") or []:
+        paths.append(s.get("path") or "")
+    for sea in entry.get("seasons") or []:
+        paths.append(sea.get("dir") or "")
+        for s in sea.get("strms") or []:
+            paths.append(s.get("path") or "")
+    for p in paths:
+        hits = dom.exempt_hit(p, kws)
+        if hits:
+            return hits
+    return []
+
+
+def _index_entries(entries: list) -> dict:
+    out = {}
+    for e in entries:
+        out.setdefault(e["identity"], e)
+    return out
+
+
+def _match_entry(share_e: dict, local_idx: dict, st: dict):
+    """分享侧作品 → 转存侧对应作品。返回 (entry | None, how)。
+
+    how: 'identity'（片名+年份）/ 'tmdb'（tmdb 命中且年份一致、候选唯一）/ 'none'
+
+    tmdb 分支刻意**要求年份一致**：只凭 tmdb 号配对会跨片命中（重拍片、条目串号、
+    目录里写错 id），一旦配错就可能删掉另一部片子的转存副本 —— 这不可接受。
+    候选不唯一时同样放弃，回落到「片名+年份」。
+    """
+    exact = local_idx.get(share_e["identity"])
+    if st.get("match") != "tmdb_first":
+        return exact, ("identity" if exact else "none")
+    smeta = share_e.get("meta") or {}
+    tid = smeta.get("tmdb")
+    if not tid:
+        return exact, ("identity" if exact else "none")
+    s_year = smeta.get("year")
+    hits = []
+    for e in local_idx.values():
+        lmeta = e.get("meta") or {}
+        if lmeta.get("tmdb") != tid:
+            continue
+        l_year = lmeta.get("year")
+        if s_year and l_year and l_year != s_year:
+            continue
+        hits.append(e)
+    if len(hits) == 1:
+        return hits[0], "tmdb"
+    return exact, ("identity" if exact else "none")
+
+
+def _entries(scans: dict, lib_key: str, kind: str) -> list:
+    out = []
+    for sc in scans.get(lib_key) or []:
+        if sc.get("kind") == kind:
+            out.extend(sc.get("entries") or [])
+    return out
+
+
+def _sibling_subs(strm_path: str) -> list:
+    """与某个 strm 同目录、同基名（去掉语言码）的字幕文件。
+
+    NanShare 的字幕是「strm 基名 + 语言码 + 扩展名」（如 xxx.zh.srt），
+    删掉 strm 后这些字幕就变成 Emby 侧的孤立文件 —— 必须跟着一起删。
+    """
+    d = os.path.dirname(strm_path)
+    stem = os.path.splitext(os.path.basename(strm_path))[0]
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    out = []
+    for n in sorted(names):
+        if not n.lower().endswith(SUB_EXTS):
+            continue
+        if _sub_base(n) == stem:
+            out.append(os.path.join(d, n))
+    return out
+
+
+def _follow_subs(drop_paths, keep_paths) -> list:
+    """待删 strm 的同名字幕（去语言码后同基名）。
+
+    排除与**保留版**同基名的字幕 —— 那种字幕是两边共用的，删了会误伤保留版。
+    """
+    keep_stems = {os.path.splitext(os.path.basename(p))[0] for p in keep_paths}
+    out = []
+    for p in drop_paths:
+        if os.path.splitext(os.path.basename(p))[0] in keep_stems:
+            continue
+        for sub in _sibling_subs(p):
+            if sub not in drop_paths and sub not in out:
+                out.append(sub)
+    return out
+
+
+def _act(cfg, *, scope, side, kind, name, cat, season=None, ep=None,
+         drop_strms=(), keep_strms=(), reason="", reason_label="",
+         compare=None, confidence=None, decided_by=None, versions=None,
+         with_guard=True) -> dict:
+    """构造一条精简动作：待删（drop）+ 保留依据（keep）+ 指纹快照。
+
+    files 里除了待删 strm，还包含它们各自的同名字幕（否则删完 strm 会留下孤立字幕）。
+    """
+    drops = [s for s in (drop_strms or []) if s.get("path")]
+    keeps = [s for s in (keep_strms or []) if s.get("path")]
+    keep_paths = []
+    for s in keeps:
+        if s["path"] not in keep_paths:
+            keep_paths.append(s["path"])
+    drops = [s for s in drops if s["path"] not in keep_paths]
+    files = [s["path"] for s in drops]
+    subs = _follow_subs(files, keep_paths)
+    files += subs
+    best_keep = _best_strm(keeps, cfg) if keeps else None
+    first = files[0] if files else (keep_paths[0] if keep_paths else None)
+    act = {
+        "scope": scope, "side": side, "kind": kind, "name": name, "cat": cat,
+        "dir": os.path.dirname(first) if first else None,
+        "season": season, "ep": ep,
+        "keep": best_keep["name"] if best_keep else None,
+        "keep_path": best_keep["path"] if best_keep else None,
+        "keep_paths": keep_paths,
+        "keep_summary": spec_summary(best_keep.get("spec") or "") if best_keep else "",
+        "versions": versions, "confidence": confidence, "decided_by": decided_by,
+        "drop": [s["name"] for s in drops],
+        "drop_detail": [{"name": s["name"], "path": s["path"],
+                         "summary": spec_summary(s.get("spec") or "")} for s in drops],
+        "files": files, "subs": subs, "guard": {},
+        "reason": reason, "reason_label": reason_label, "compare": compare,
+    }
+    if with_guard:
+        for p in files:
+            fp = _fingerprint(p, exts=ALL_EXTS)
+            if fp:
+                act["guard"][p] = fp
+    return act
+
+
+def _plan_movie(se, le, cfg, st, kws, quiet, decision, tie_keep, stats, with_guard):
+    if quiet([se.get("dir"), le.get("dir")]):
+        stats["quiet"] += 1
+        return []
+    if _exempt_hits(se, kws) or _exempt_hits(le, kws):
+        stats["exempt"] += 1
+        return [_act(cfg, scope="cross", side=None, kind=KIND_MOVIE, name=se["name"],
+                     cat=se["cat"], reason="whitelist", reason_label="白名单豁免",
+                     with_guard=with_guard)]
+    s_best = _best_strm(se["strms"], cfg)
+    l_best = _best_strm(le["strms"], cfg)
+    ncmp, spec_of = _name_cmp([s_best, l_best], cfg)
+    meta = _compare_meta(s_best["name"], l_best["name"], cfg, spec_of)
+    versions = len(se["strms"]) + len(le["strms"])
+    verdict = dom.movie_verdict(s_best["name"], l_best["name"], decision, ncmp, tie_keep)
+    if verdict == "skip":
+        # 全部打平（规格读不出 / 九维都一致）→ 不动。删哪边都可能删错。
+        stats["tie"] += 1
+        return []
+    stats["cross"] += 1
+    if verdict == "share":
+        return [_act(cfg, scope="cross", side=SIDE_LOC, kind=KIND_MOVIE, name=se["name"],
+                     cat=se["cat"], drop_strms=le["strms"], keep_strms=[s_best],
+                     reason="share_better",
+                     reason_label="分享更优-淘汰转存" if decision == "quality_first" else "决策保留分享-淘汰转存",
+                     compare=meta, versions=versions, with_guard=with_guard)]
+    return [_act(cfg, scope="cross", side=SIDE_SHR, kind=KIND_MOVIE, name=se["name"],
+                 cat=se["cat"], drop_strms=se["strms"], keep_strms=[l_best],
+                 reason="local_better",
+                 reason_label="转存更优-淘汰分享" if decision == "quality_first" else "决策保留转存-淘汰分享",
+                 compare=meta, versions=versions, with_guard=with_guard)]
+
+
+def _emit_season_residuals(cfg, se, sn, cmp, s_sea, l_sea, with_guard):
+    """残次品独立判定（与画质方向无关）：谁不完整删谁。"""
+    acts = []
+    res_l, res_s = dom.residual_flags(cmp, bool(l_sea["strms"]), bool(s_sea["strms"]))
+    if res_l:
+        gap = _side_gap_desc(cmp["l_eps"].keys())
+        acts.append(_act(cfg, scope="cross", side=SIDE_LOC, kind=KIND_TV, name=se["name"],
+                         cat=se["cat"], season=sn, drop_strms=l_sea["strms"],
+                         keep_strms=s_sea["strms"],
+                         reason="residual_local", reason_label=f"残次品-删转存（{gap}）",
+                         with_guard=with_guard))
+    if res_s:
+        gap = _side_gap_desc(cmp["s_eps"].keys())
+        acts.append(_act(cfg, scope="cross", side=SIDE_SHR, kind=KIND_TV, name=se["name"],
+                         cat=se["cat"], season=sn, drop_strms=s_sea["strms"],
+                         keep_strms=l_sea["strms"],
+                         reason="residual_share", reason_label=f"残次品-删分享（{gap}）",
+                         with_guard=with_guard))
+    return acts
+
+
+def _emit_season_act(cfg, se, sn, s_sea, l_sea, ratio, decision, tie_keep,
+                     stats, with_guard):
+    """单季跨库精简：先判完整性（残次品），完整才逐集择优。"""
+    cmp = _season_cmp(s_sea["strms"], l_sea["strms"], cfg, tie_keep)
+    v = dom.season_verdict(cmp, bool(l_sea["strms"]), bool(s_sea["strms"]), ratio, tie_keep)
+    acts = _emit_season_residuals(cfg, se, sn, cmp, s_sea, l_sea, with_guard)
+    if v["outcome"] in ("incomplete", "no_common"):
+        return acts
+    if v["outcome"].endswith("_skip"):
+        # tie_skip（全部打平，默认不动）/ ambiguous_skip（分享不达标也不弱于本地）
+        stats["tie"] += 1
+        return acts
+    stats["cross"] += 1
+    if v["outcome"] == "share_wins" or v["outcome"] == "tie_share":
+        acts.append(_act(cfg, scope="cross", side=SIDE_LOC, kind=KIND_TV, name=se["name"],
+                         cat=se["cat"], season=sn, drop_strms=l_sea["strms"],
+                         keep_strms=s_sea["strms"], reason="share_wins",
+                         reason_label="分享达标-淘汰转存", compare=cmp["sample"],
+                         with_guard=with_guard))
+    else:
+        label = "转存更全-淘汰分享" if v["outcome"] == "local_wins_fewer" else \
+                ("平局保留转存-淘汰分享" if v["outcome"] == "tie_local" else "转存更优-淘汰分享")
+        acts.append(_act(cfg, scope="cross", side=SIDE_SHR, kind=KIND_TV, name=se["name"],
+                         cat=se["cat"], season=sn, drop_strms=s_sea["strms"],
+                         keep_strms=l_sea["strms"], reason="local_wins",
+                         reason_label=label, compare=cmp["sample"],
+                         with_guard=with_guard))
+    return acts
+
+
+def _season_acts_full(cfg, se, s_proper, l_proper, ratio, tie_keep, stats, with_guard):
+    """多季保护 compare 档 · 两边季集合包含：整剧零和（分享全季达标才整体删转存）。"""
+    all_pass = dom.multi_all_pass(
+        l_proper, s_proper,
+        lambda s, l: _season_cmp(s["strms"], l["strms"], cfg, tie_keep), ratio)
+    acts = []
+    if all_pass:
+        for sn, l_sea in sorted(l_proper.items()):
+            if sn not in s_proper:
+                continue
+            stats["cross"] += 1
+            acts.append(_act(cfg, scope="cross", side=SIDE_LOC, kind=KIND_TV, name=se["name"],
+                             cat=se["cat"], season=sn, drop_strms=l_sea["strms"],
+                             keep_strms=s_proper[sn]["strms"], reason="multi_full_share",
+                             reason_label="整剧零和-分享替代",
+                             compare=_season_cmp(s_proper[sn]["strms"], l_sea["strms"],
+                                                 cfg, tie_keep)["sample"],
+                             with_guard=with_guard))
+    else:
+        for sn, s_sea in sorted(s_proper.items()):
+            if sn not in l_proper:
+                continue
+            acts += _emit_season_act(
+                cfg, se, sn, s_sea, l_proper[sn], ratio, "quality_first",
+                tie_keep, stats, with_guard)
+    return acts
+
+
+def _share_protect_acts(cfg, se, s_proper, l_proper, ratio, tie_keep, stats, with_guard):
+    """多季保护 · 分享合集优先：转存同季副本纳入清理（残次品仍各自独立判定）。"""
+    acts = []
+    for sn, l_sea in sorted(l_proper.items()):
+        if sn not in s_proper:
+            continue
+        s_sea = s_proper[sn]
+        cmp = _season_cmp(s_sea["strms"], l_sea["strms"], cfg, tie_keep)
+        resid = _emit_season_residuals(cfg, se, sn, cmp, s_sea, l_sea, with_guard)
+        acts += resid
+        if resid:
+            continue
+        if not cmp["s_complete"] or not cmp["l_complete"]:
+            continue
+        verdict = dom.share_protect_verdict(cmp)
+        if verdict == "skip":
+            continue
+        stats["cross"] += 1
+        if verdict == "share_fewer":
+            acts.append(_act(cfg, scope="cross", side=SIDE_SHR, kind=KIND_TV, name=se["name"],
+                             cat=se["cat"], season=sn, drop_strms=s_sea["strms"],
+                             keep_strms=l_sea["strms"], reason="local_wins",
+                             reason_label="转存更全-淘汰分享", with_guard=with_guard))
+        else:
+            acts.append(_act(cfg, scope="cross", side=SIDE_LOC, kind=KIND_TV, name=se["name"],
+                             cat=se["cat"], season=sn, drop_strms=l_sea["strms"],
+                             keep_strms=s_sea["strms"], reason="multi_protect_local",
+                             reason_label="多季保护-淘汰转存",
+                             with_guard=with_guard))
+    return acts
+
+
+def _plan_tv(se, le, cfg, st, kws, quiet, decision, tie_keep, stats, with_guard):
+    s_seasons = {sea["season"]: sea for sea in (se.get("seasons") or [])}
+    l_seasons = {sea["season"]: sea for sea in (le.get("seasons") or [])}
+    dirs = [se.get("dir"), le.get("dir")]
+    dirs += [x.get("dir") for x in (se.get("seasons") or [])]
+    dirs += [x.get("dir") for x in (le.get("seasons") or [])]
+    if quiet(dirs):
+        stats["quiet"] += 1
+        return []
+    if _exempt_hits(se, kws) or _exempt_hits(le, kws):
+        stats["exempt"] += 1
+        return [_act(cfg, scope="cross", side=None, kind=KIND_TV, name=se["name"],
+                     cat=se["cat"], reason="whitelist", reason_label="白名单豁免",
+                     with_guard=with_guard)]
+
+    ratio = _clamp_ratio(st.get("season_replace_ratio"))
+    acts = []
+    s00, l00 = s_seasons.get(0), l_seasons.get(0)
+    special = st.get("special_action") or "compare"
+    protect_s00 = dom.protect_s00(st.get("multi_season_protect"), special, decision,
+                                  list(l_seasons), list(s_seasons))
+    if special == "delete":
+        if l00 and s00 and decision != "keep_local":
+            stats["cross"] += 1
+            acts.append(_act(cfg, scope="cross", side=SIDE_LOC, kind=KIND_TV, name=se["name"],
+                             cat=se["cat"], season=0, drop_strms=l00["strms"],
+                             keep_strms=s00["strms"],
+                             reason="special_delete_local", reason_label="特别篇清理-删转存",
+                             with_guard=with_guard))
+    elif special != "ignore" and s00 and l00 and not protect_s00:
+        s_best = _best_strm(s00["strms"], cfg)
+        l_best = _best_strm(l00["strms"], cfg)
+        ncmp, spec_of = _name_cmp([s_best, l_best], cfg)
+        meta = _compare_meta(s_best["name"], l_best["name"], cfg, spec_of)
+        verdict = dom.movie_verdict(s_best["name"], l_best["name"], decision, ncmp, tie_keep)
+        if verdict == "skip":
+            stats["tie"] += 1       # 特别篇全部打平 → 不动
+        else:
+            stats["cross"] += 1
+            if verdict == "share":
+                acts.append(_act(cfg, scope="cross", side=SIDE_LOC, kind=KIND_TV, name=se["name"],
+                                 cat=se["cat"], season=0, drop_strms=l00["strms"],
+                                 keep_strms=s00["strms"], reason="special_share_better",
+                                 reason_label="特别篇分享更优-删转存", compare=meta,
+                                 with_guard=with_guard))
+            else:
+                acts.append(_act(cfg, scope="cross", side=SIDE_SHR, kind=KIND_TV, name=se["name"],
+                                 cat=se["cat"], season=0, drop_strms=s00["strms"],
+                                 keep_strms=l00["strms"], reason="special_local_better",
+                                 reason_label="特别篇转存更优-删分享", compare=meta,
+                                 with_guard=with_guard))
+
+    lo = 0 if protect_s00 else 1
+    s_proper = {k: v for k, v in s_seasons.items() if k >= lo}
+    l_proper = {k: v for k, v in l_seasons.items() if k >= lo}
+
+    if decision in ("keep_local", "keep_share"):
+        for sn, s_sea in sorted(s_proper.items()):
+            if sn not in l_proper:
+                continue
+            cmp = _season_cmp(s_sea["strms"], l_proper[sn]["strms"], cfg, tie_keep)
+            if decision == "keep_local":
+                if (not cmp["l_complete"]
+                        or not set(cmp["s_eps"]) <= set(cmp["l_eps"])):
+                    continue
+                stats["cross"] += 1
+                acts.append(_act(cfg, scope="cross", side=SIDE_SHR, kind=KIND_TV, name=se["name"],
+                                 cat=se["cat"], season=sn, drop_strms=s_sea["strms"],
+                                 keep_strms=l_proper[sn]["strms"],
+                                 reason="decision_keep_local", reason_label="决策保留转存-删分享",
+                                 with_guard=with_guard))
+                continue
+            if not cmp["s_complete"] or not dom.share_covers_local(cmp):
+                continue
+            stats["cross"] += 1
+            acts.append(_act(cfg, scope="cross", side=SIDE_LOC, kind=KIND_TV, name=se["name"],
+                             cat=se["cat"], season=sn, drop_strms=l_proper[sn]["strms"],
+                             keep_strms=s_sea["strms"],
+                             reason="decision_keep_share", reason_label="决策保留分享-删转存",
+                             with_guard=with_guard))
+        return acts
+
+    multi = st.get("multi_season_protect")
+    if multi == "compare" and (len(l_proper) >= 2 or len(s_proper) >= 2):
+        mode = dom.multi_protect_mode(list(s_proper), list(l_proper))
+        sp = {k: v for k, v in s_proper.items() if k > 0}
+        lp = {k: v for k, v in l_proper.items() if k > 0}
+        s0, l0 = s_proper.get(0), l_proper.get(0)
+        if mode == "share_protect":
+            acts += _share_protect_acts(cfg, se, sp, lp, ratio, tie_keep, stats, with_guard)
+            if s0 and l0:
+                stats["cross"] += 1
+                acts.append(_act(cfg, scope="cross", side=SIDE_LOC, kind=KIND_TV,
+                                 name=se["name"], cat=se["cat"], season=0,
+                                 drop_strms=l0["strms"], keep_strms=s0["strms"],
+                                 reason="multi_protect_local",
+                                 reason_label="多季保护-淘汰转存", with_guard=with_guard))
+        elif mode == "full":
+            winner = _season_acts_full(cfg, se, sp, lp, ratio, tie_keep, stats, with_guard)
+            acts += winner
+            if s0 and l0:
+                # 整剧零和时 S00 跟随主结论
+                share_took = any(a["side"] == SIDE_LOC for a in winner)
+                stats["cross"] += 1
+                if share_took:
+                    acts.append(_act(cfg, scope="cross", side=SIDE_LOC, kind=KIND_TV,
+                                     name=se["name"], cat=se["cat"], season=0,
+                                     drop_strms=l0["strms"], keep_strms=s0["strms"],
+                                     reason="multi_full_share",
+                                     reason_label="整剧零和-分享替代", with_guard=with_guard))
+                else:
+                    acts.append(_act(cfg, scope="cross", side=SIDE_SHR, kind=KIND_TV,
+                                     name=se["name"], cat=se["cat"], season=0,
+                                     drop_strms=s0["strms"], keep_strms=l0["strms"],
+                                     reason="multi_protect_partial_share",
+                                     reason_label="多季保护-淘汰分享", with_guard=with_guard))
+        else:
+            for sn in sorted(set(sp) & set(lp)):
+                cmp = _season_cmp(sp[sn]["strms"], lp[sn]["strms"], cfg, tie_keep)
+                acts += _emit_season_residuals(cfg, se, sn, cmp, sp[sn], lp[sn], with_guard)
+        return acts
+
+    for sn, s_sea in sorted(s_proper.items()):
+        if sn not in l_proper:
+            continue
+        acts += _emit_season_act(cfg, se, sn, s_sea, l_proper[sn], ratio, decision,
+                                 tie_keep, stats, with_guard)
+    return acts
+
+
+def analyze_dual(scans: dict, cfg: dict, with_guard: bool = False):
+    """跨库对照：分享已整理 ↔ 转存已整理。返回 (actions, stats)。
+
+    with_guard=False 时只做决策不落指纹（报告用）；True 时逐文件取指纹（计划用）。
+
+    两条去重保证「一个文件只会出现在一个动作里」：
+      ① 分享侧同一 identity 出现多份（库内自身重复）→ 只取 strm 最多的那份参与对照；
+      ② 转存侧每部作品只被认领一次 → 后续再命中就跳过（tmdb 交叉命中的兜底）。
+    """
+    st = _strategy(cfg)
+    kws = [k for k in (st.get("exempt_keywords") or []) if k]
+    decision = st.get("decision") or "quality_first"
+    tie_keep = _tie_keep(st)
+    quiet = _make_quiet_gate(st.get("quiet_minutes"))
+    actions = []
+    stats = {"cross": 0, "exempt": 0, "quiet": 0, "no_match": 0, "tie": 0, "dup": 0}
+
+    for kind in (KIND_MOVIE, KIND_TV):
+        share_entries = _entries(scans, "share", kind)
+        uniq = {}
+        for se in share_entries:
+            cur = uniq.get(se["identity"])
+            if cur is None or len(se.get("strms") or []) > len(cur.get("strms") or []):
+                uniq[se["identity"]] = se
+        stats["dup"] += len(share_entries) - len(uniq)
+        l_idx = _index_entries(_entries(scans, "transcode", kind))
+        claimed = set()
+        for se in uniq.values():
+            le, _how = _match_entry(se, l_idx, st)
+            if not le:
+                stats["no_match"] += 1
+                continue
+            if le["identity"] in claimed:
+                stats["dup"] += 1
+                continue
+            claimed.add(le["identity"])
+            if kind == KIND_MOVIE:
+                actions += _plan_movie(se, le, cfg, st, kws, quiet, decision,
+                                       tie_keep, stats, with_guard)
+            else:
+                actions += _plan_tv(se, le, cfg, st, kws, quiet, decision,
+                                    tie_keep, stats, with_guard)
+    return actions, stats
+
+
+def build_dual_plan(scans: dict, cfg: dict):
+    """跨库精简计划（含指纹快照）。"""
+    return analyze_dual(scans, cfg, with_guard=True)
+
+
 # ─────────────────────────── 计划 / 执行 ───────────────────────────
 
 _CONF_ORDER = {"high": 0, "medium": 1, "weak": 2, "tie": 3}
 
 
 def build_plan(idx: dict, kind: str, cfg: dict, min_conf: str = "weak") -> dict:
-    """生成治理计划：多版本里「保留最优 + 待删其余」。只产候选与指纹，不执行删除。
+    """生成精简计划：多版本里「保留最优 + 待删其余」。只产候选与指纹，不执行删除。
 
     min_conf: 只收录置信度不低于该档的作品（high > medium > weak > tie）。
     """
@@ -900,18 +1543,49 @@ def build_plan(idx: dict, kind: str, cfg: dict, min_conf: str = "weak") -> dict:
                "decided_by": m.get("decided_by"),
                "reason": f"{m['count']} 个版本择优（unknown={cfg.get('unknown')}，"
                          f"决胜维度 {'/'.join(m.get('decided_by') or []) or '全部打平'}）",
-               "files": [], "guard": {}}
+               "files": [], "subs": [], "guard": {}}
         for d in drops:
-            p = d["path"]
-            fp = _fingerprint(p)
-            act["files"].append(p)
+            act["files"].append(d["path"])
+        # 字幕跟删：删掉某个版本的 strm 后，它自己的字幕会变成孤立文件
+        act["subs"] = _follow_subs(act["files"], [m["best_path"]])
+        act["files"] += act["subs"]
+        for p in act["files"]:
+            fp = _fingerprint(p, exts=ALL_EXTS)
             if fp:
                 act["guard"][p] = fp
         actions.append(act)
+    local_actions = actions
+    dual_actions = []
+    for source in (idx.get("dual") or {}).get("actions") or []:
+        if source.get("kind") != kind or not source.get("files"):
+            continue
+        action = dict(source)
+        action["guard"] = {}
+        for path in action.get("files") or []:
+            fp = _fingerprint(path, exts=ALL_EXTS)
+            if fp:
+                action["guard"][path] = fp
+        dual_actions.append(action)
+    dual_drop_paths = {p for a in dual_actions for p in a.get("files") or []}
+    actions = []
+    for action in local_actions:
+        if action.get("keep_path") in dual_drop_paths:
+            continue
+        action["files"] = [p for p in action.get("files") or [] if p not in dual_drop_paths]
+        action["subs"] = [p for p in action.get("subs") or [] if p in action["files"]]
+        action["guard"] = {p: fp for p, fp in (action.get("guard") or {}).items()
+                              if p in action["files"]}
+        action["drop_detail"] = [d for d in action.get("drop_detail") or []
+                                     if d.get("path") in action["files"]]
+        action["drop"] = [d.get("name") for d in action["drop_detail"]]
+        if action["files"]:
+            actions.append(action)
+    actions.extend(dual_actions)
+
     return {"version": 1, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
             "kind": kind,
             "strategy": {"unknown": cfg.get("unknown"), "order": cfg.get("order"),
-                         "min_confidence": min_conf},
+                         "min_confidence": min_conf, **_strategy(cfg)},
             "skipped_low_confidence": skipped,
             "actions": actions}
 
@@ -922,7 +1596,7 @@ def validate_plan(plan: dict) -> list:
     for act in plan.get("actions", []):
         for p in act.get("files", []):
             old = (act.get("guard") or {}).get(p)
-            new = _fingerprint(p)
+            new = _fingerprint(p, exts=ALL_EXTS)
             if not old:
                 bad.append({"path": p, "reason": "计划缺少指纹快照，请重新生成计划"})
             elif new is None:
@@ -971,6 +1645,7 @@ def load_cfg(path: str) -> dict:
         "enabled": ENABLED_DEFAULT,
         "tiers": TIERS_DEFAULT,
         "release_groups": [],
+        "strategy": dict(STRATEGY_DEFAULT),
     }
     if path and os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as f:
@@ -982,6 +1657,8 @@ def load_cfg(path: str) -> dict:
         for k in ("unknown", "order", "enabled", "tiers", "release_groups"):
             if k in q:
                 cfg[k] = q[k]
+        if isinstance(user.get("strategy"), dict):
+            cfg["strategy"].update(user["strategy"])
     return cfg
 
 
@@ -1029,6 +1706,7 @@ def analyze_all(scans: dict, cfg: dict) -> dict:
     share, tc = scans.get("share", []), scans.get("transcode", [])
     all_entries = [e for sc in share for e in sc["entries"]]
     mv = analyze_multi_version(all_entries, cfg)
+    dual_actions, dual_stats = analyze_dual(scans, cfg, with_guard=False)
     errors = [err for sc in share + tc for err in sc["errors"]]
     return {
         "multi_version": mv,
@@ -1037,6 +1715,7 @@ def analyze_all(scans: dict, cfg: dict) -> dict:
         "naming": analyze_naming(all_entries),
         "orphan_subs": analyze_orphan_subs(all_entries),
         "cross": analyze_cross_lib(share, tc),
+        "dual": {"actions": dual_actions, "stats": dual_stats},
         "errors": errors,
     }
 
@@ -1048,7 +1727,7 @@ def main(argv=None):
     except Exception:
         pass
 
-    ap = argparse.ArgumentParser(prog="nankeep", description="NanShare strm 库治理工具（只读优先）")
+    ap = argparse.ArgumentParser(prog="nankeep", description="NanShare strm 库精简工具（只读优先）")
     ap.add_argument("--root", default=None, help="库根（默认读配置 / 内置 UNC）")
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "nankeep.config.json"))
     ap.add_argument("--order", default=None,
@@ -1060,12 +1739,12 @@ def main(argv=None):
     p_scan = sub.add_parser("scan", help="扫描两库并落索引 JSON")
     p_scan.add_argument("--lib", default="share", choices=["share", "transcode", "both"])
 
-    p_rep = sub.add_parser("report", help="生成治理报告（markdown）")
+    p_rep = sub.add_parser("report", help="生成精简报告（markdown）")
     p_rep.add_argument("--top", type=int, default=50, help="每表最多列几条，0=全部")
     p_rep.add_argument("--lib", default="both", choices=["share", "transcode", "both"])
     p_rep.add_argument("--use-cache", action="store_true", help="复用 out/library.json 索引，跳过扫描")
 
-    p_plan = sub.add_parser("plan", help="生成治理计划 JSON")
+    p_plan = sub.add_parser("plan", help="生成精简计划 JSON")
     p_plan.add_argument("--kind", default="movie", choices=["movie", "tv"])
     p_plan.add_argument("--lib", default="share", choices=["share", "transcode", "both"])
     p_plan.add_argument("--use-cache", action="store_true", help="复用 out/library.json 索引，跳过扫描")
@@ -1170,3 +1849,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+

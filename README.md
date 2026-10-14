@@ -1,6 +1,6 @@
-# nankeep —— NanShare strm 库治理工具
+# nankeep —— NanShare strm 库精简工具
 
-针对 NanShare 输出的 `\\<你的NAS>\emby\strm\nanshare` 的「分享已整理 / 转存已整理」双库做**只读优先**的治理：
+针对 NanShare 输出的 `\\<你的NAS>\emby\strm\nanshare` 的「分享已整理 / 转存已整理」双库做**只读优先**的精简：
 
 ```
 扫描 → 规格解析 → 多版本择优 / 逐集混版本 / 缺集 / 命名异常 / 孤立字幕 / 跨库对照
@@ -26,11 +26,11 @@ cd /path/to/nankeep
 # 1) 扫描并落索引（约 60~90 秒，输出 out/library.json.gz，约 2.7 MB）
 python nankeep.py scan --lib share
 
-# 2) 出治理报告（复用索引，秒出）
+# 2) 出精简报告（复用索引，秒出）
 python nankeep.py report --lib share --use-cache --top 50
 #    → out/report.md  +  out/analysis.json
 
-# 3) 生成治理计划（默认电影；含文件指纹）
+# 3) 生成精简计划（默认电影；含文件指纹）
 python nankeep.py plan --kind movie --use-cache
 #    → out/plan_movie.json
 
@@ -45,13 +45,14 @@ python nankeep_web.py
 
 ## Web 层（推荐：随时随地可用）
 
-CLI 只能在工作机的终端里跑。Web 层把同一套治理逻辑（**完全复用 `nankeep.py`，不是重写**）
+CLI 只能在工作机的终端里跑。Web 层把同一套精简逻辑（**完全复用 `nankeep.py`，不是重写**）
 包成一个常驻服务，部署在 NAS 上后用 Lucky 反代出去，手机/公司/任何地方打开浏览器就能用。
 
 ```
 容器 nankeep（python:3.12-slim, uid 1000）
    ├─ /library  ←  /path/to/nanshare                  （读写：删除需要写权限；改成你的真实路径）
-   └─ /data     ←  ./data                              （SQLite 计划+审计 / 索引缓存 / 互斥锁）
+   ├─ /data     ←  ./data                              （SQLite 计划+审计 / 索引缓存 / 互斥锁）
+   └─ /app/nankeep.config.json ← ./config.json:ro       （画质档位 / 双库策略，改完重启即生效）
         │
         └── :8322 ──→ iKuai 上的 Lucky 反代 ──→ https://<你的域名>
 ```
@@ -61,11 +62,15 @@ CLI 只能在工作机的终端里跑。Web 层把同一套治理逻辑（**完�
 ```bash
 mkdir -p /opt/nankeep && cd /opt/nankeep
 # 放入 docker-compose.yml，改三处：NANKEEP_PASSWORD、volumes 左侧库路径、NANKEEP_ALLOWED_ORIGINS
+cp nankeep.config.json config.json                  # 配置文件挂载点（不挂也行，用镜像内默认）
 mkdir -p data && sudo chown -R 1000:1000 data      # 容器以 uid 1000 运行，data 必须可写
 docker compose up -d
 docker compose logs -f                              # 看到 "web 已启动" 即成功
 curl -s localhost:8322/api/health                   # {"ok":true,...}
 ```
+
+改 `config.json`（比如把 `strategy.tie_keep` 从 `skip` 改成 `local`）后 `docker compose restart`
+即生效。规则指纹（`rule_sig`）随之变化，**旧计划会自动作废**，不会拿新规则去删旧结论。
 
 **镜像**：`ghcr.io/utterliar1/nankeep:latest`。
 推 `v*` tag 会触发 CI 构建 amd64+arm64 双架构并推送，所以 NAS 架构通常直接可用
@@ -111,7 +116,7 @@ curl -s localhost:8322/api/health                   # {"ok":true,...}
 
 | 视图 | 内容 | 会删文件吗 |
 | --- | --- | --- |
-| **总览** | 两库规模 KPI、按库×区的分类分布条、治理待办计数（点进报告对应章节）、最近治理时间线、计划与运行状态 | 不会 |
+| **总览** | 两库规模 KPI、按库×区的分类分布条、精简待办计数（点进报告对应章节）、最近精简时间线、计划与运行状态 | 不会 |
 | **报告** | `report.md` 渲染成带章节导航的页面（吸顶目录 + 滚动高亮），支持复制/下载 Markdown | 不会 |
 | **清理计划** | 计划列表 + **保留版 / 待删版并排对照**（规格摘要、版本数、置信度、择依据）；「执行前复核」逐文件重算指纹并列出不一致项 | 不会 |
 | **清理计划** | **「执行删除」**：必须①复核返回 `executable` ②勾选确认 ③精确输入确认短语，三个条件同时满足按钮才可点 | **会** |
@@ -143,7 +148,8 @@ curl -s localhost:8322/api/health                   # {"ok":true,...}
 | 5. 命名异常 | 目录缺 `{tmdbid-N}`、用了长横 `{tmdb-N}`、规格段含 `[]` / `, `、HTML 实体、Windows 非法字符 | 修命名 |
 | 6. 孤立字幕 | 无同名 strm 的字幕 | 归位或清理 |
 | 7. 跨库对照 | 分享已整理 vs 转存已整理 的差集 | 查两库不一致 |
-| 8. 扫描错误 | 单条读取失败 | 排查权限/命名怪例 |
+| **8. 双库精简建议** | 对两库都存在的作品，按画质、完整度和策略决定淘汰侧 | 生成可审阅的跨库待删动作 |
+| 9. 扫描错误 | 单条读取失败 | 排查权限/命名怪例 |
 
 ## 画质比较（9 维）
 
@@ -263,6 +269,16 @@ python nankeep.py plan --kind movie --min-confidence high   # 只出最有把握
     "enabled": { "release_group": false, "source": true, "...": true },
     "tiers": { "resolution": ["8K","4K","2K","1080p","720p","SD","未识别"], "...": [] },
     "release_groups": []
+  },
+  "strategy": {
+    "decision": "quality_first",
+    "tie_keep": "skip",
+    "season_replace_ratio": 0.9,
+    "multi_season_protect": "compare",
+    "special_action": "compare",
+    "exempt_keywords": [],
+    "quiet_minutes": 15,
+    "match": "title_year"
   }
 }
 ```
@@ -270,12 +286,23 @@ python nankeep.py plan --kind movie --min-confidence high   # 只出最有把握
 - `unknown`：`skip`（默认，保守）| `worst`（StrimKeep 口径）
 - `enabled` / `order` / `tiers`：逐维开关、比较顺序、档位高低（数组靠前 = 更优）
 - `release_groups`：维护后把 `release_group` 打开才生效
+- `strategy.decision`：`quality_first` 按画质比较，或显式固定 `keep_share` / `keep_local`
+- `strategy.tie_keep`：九维**全部打平**时怎么办 —— `skip`（默认，**哪边都不删**）| `local` | `share`。
+  默认 `skip` 是有意为之：规格读不出来 ≠ 谁更差，此时删任何一边都可能删错。
+  （老配置里的 `tie_keep_local` 布尔仍认：`true` → `local`，`false` → `share`。）
+- `strategy.season_replace_ratio`：剧集分享侧在**分胜负的集**里胜出达到该比例，且集数不少于转存侧，才替换整季；范围 `0.5` 到 `1.0`。整季一集都分不出胜负 → 按 `tie_keep` 处理（默认不动）
+- `strategy.multi_season_protect`：多季剧集使用 `compare` 保护整季集合，或 `off` 按季独立处理
+- `strategy.special_action`：特别篇 `compare`、`ignore`，或显式 `delete`；删除仍受执行前保留版检查
+- `strategy.exempt_keywords`：作品名、目录或 strm 路径命中即跳过双库动作
+- `strategy.quiet_minutes`：目录最近变更后的静默分钟数，默认 `15`，避免新入库内容立即被处理
+- `strategy.match`：默认按片名+年份配对；`tmdb_first` 在 tmdbid 命中时优先按 tmdbid 配对，
+  但**要求年份一致且候选唯一**，否则回落到片名+年份（避免重拍片/串号导致跨片删错）
 
 ## 设计约束（沿用本项目约定）
 
 - 给 NAS 拼路径**禁用 `os.path.join`** → 一律 f-string 手拼 `/`，避免 Windows 反斜杠混入。
 - **stdlib only**，无第三方依赖；脚本 LF、UTF-8。
-- **治理身份 = 目录的「片名 + 年份」**，tmdbid 仅作辅助 —— 防止错误的 tmdbid 把 A 与 B 合并。
+- **精简身份 = 目录的「片名 + 年份」**，tmdbid 仅作辅助 —— 防止错误的 tmdbid 把 A 与 B 合并。
 - **Windows 平台的指纹坑**：`os.stat().st_ctime_ns` 是「创建时间」，而 `os.fstat().st_ctime_ns` 会被填成 mtime，
   两者天然不等 → 做身份比对时 Windows 必须剔除 `ctime`，否则指纹永远对不上（已按平台分支处理）。
 
@@ -283,22 +310,24 @@ python nankeep.py plan --kind movie --min-confidence high   # 只出最有把握
 
 - 剧集「缺前序」在**文件名用全剧连续集号**时是假阳性；工具用「文件名季号 ≠ 目录季号」+「已有区间比缺失区间还短」
   两个启发式识别，只报「中间断层」为确证，并在备注列出。仍有少数命名怪例可能漏判。
-- **5.4% 的 strm 完全没有规格段** → 这些参与择优时各维全打平，只能靠人工或解 302 取真实源名/体积。
+- **5.4% 的 strm 完全没有规格段** → 这些参与择优时各维全打平。默认档（`tie_keep: "skip"`）
+  下**不做任何动作**；要人工判断就解 302 取真实源名/体积。
 - **体积择优未做**：strm 本身无体积，要比体积需解 302 取 115 真实文件大小 —— 会引入大量网络请求，属下一步。
 - `转存已整理` 侧尚未实测（结构与分享侧镜像，`--lib both` 可跑）。
 - 本工具只处理 strm 的**择优与重复**；分类归位、tmdbid 补写、字幕语言码归位仍是既有技能的事。
+  但删 strm 时会把**同名（去语言码）字幕一起删**，避免留下孤立字幕；与保留版共享的字幕不动。
 - **fail-safe 的次优点**：若最优版本指纹校验失败，计划保留它、执行时跳过 —— 安全但不够优
   （更优做法是回退到次优可校验版本）。已记录，待改。
 
 ## 开发与测试
 
 ```bash
-# stdlib 单测（66 例：解析/指纹/九维/缺集/命名/会话/CSRF/互斥锁/任务总线/
-#                  计划守卫/fail-safe/渲染/总览聚合）
+# stdlib 单测（87 例：解析/指纹/九维/缺集/命名/双库精简/平局档/tmdb 配对/字幕跟删/
+#                  会话/CSRF/互斥锁/任务总线/计划守卫/fail-safe/渲染/总览聚合）
 python -m unittest discover -s tests -v
 
-# 端到端（60 项 HTTP 断言：登录→CSRF→扫描→报告→计划→复核→dry-run→确认短语→
-#                     真删→一次性→总览聚合→静态资源与穿越→审计→登出）
+# 端到端（70 项 HTTP 断言：登录→CSRF→扫描→报告→计划→双库动作→复核→dry-run→
+#                     确认短语→真删→一次性→总览聚合→静态资源与穿越→审计→登出）
 python tests/e2e.py
 ```
 
@@ -314,3 +343,4 @@ MIT（见 `LICENSE`）。
 上游工具不同（它是 TgtoDrive，本项目是 NanShare），nankeep 的代码为独立实现，
 沿用其「操作分级 + 执行前复核 + 低置信度不删」的思路；界面的信息架构
 （侧栏多视图 + 总览 KPI + 分布条 + 审计时间线）同样受其启发，样式与实现自写。
+
