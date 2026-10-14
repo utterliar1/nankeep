@@ -59,22 +59,41 @@ CLI 只能在工作机的终端里跑。Web 层把同一套精简逻辑（**完�
 
 ### 部署（NAS 上）
 
+不需要 `git clone`，也不需要本机构建 —— 镜像由 GitHub Actions 构建好推到 ghcr，直接拉。
+
 ```bash
 mkdir -p /opt/nankeep && cd /opt/nankeep
-# 放入 docker-compose.yml，改三处：NANKEEP_PASSWORD、volumes 左侧库路径、NANKEEP_ALLOWED_ORIGINS
+# 放入仓库里的 docker-compose.yml，改三处：NANKEEP_PASSWORD、volumes 左侧库路径、NANKEEP_ALLOWED_ORIGINS
 cp nankeep.config.json config.json                  # 配置文件挂载点（不挂也行，用镜像内默认）
 mkdir -p data && sudo chown -R 1000:1000 data      # 容器以 uid 1000 运行，data 必须可写
+docker compose pull                                 # 拉取 ghcr.io/utterliar1/nankeep:<版本>
 docker compose up -d
 docker compose logs -f                              # 看到 "web 已启动" 即成功
-curl -s localhost:8322/api/health                   # {"ok":true,...}
+curl -s localhost:8322/api/health                   # {"ok":true,"version":"0.3.0",...}
 ```
 
 改 `config.json`（比如把 `strategy.tie_keep` 从 `skip` 改成 `local`）后 `docker compose restart`
 即生效。规则指纹（`rule_sig`）随之变化，**旧计划会自动作废**，不会拿新规则去删旧结论。
 
 **镜像**：`ghcr.io/utterliar1/nankeep:latest`。
-推 `v*` tag 会触发 CI 构建 amd64+arm64 双架构并推送，所以 NAS 架构通常直接可用
-（`docker compose pull` 即可升级）。用 `:v0.2.0` 锁版本，`:latest` 跟随主线。
+推 `v*` tag 会触发 CI 先跑测试、再构建 amd64+arm64 双架构并推送，所以 NAS 架构通常直接可用
+（`docker compose pull && docker compose up -d` 即升级）。用 `:0.3.0` 这样**不带 `v`** 的版本号锁版本，
+`:latest` 跟随主线。
+
+> **包可见性**：默认是 Private，匿名 `docker pull` 会报 `denied`。本仓库代码本就公开，
+> 建议在 GitHub 的 Packages 页把 `nankeep` 改为 **Public**（Package settings → Change visibility），
+> 之后 NAS 直接拉即可。若要保持 Private，就在 NAS 上先登录一次：
+> `echo <PAT> | docker login ghcr.io -u utterliar1 --password-stdin`（PAT 需要 `read:packages` 权限）。
+
+### 发布与升级
+
+```
+改代码 → git commit → git tag v0.3.1 && git push origin v0.3.1
+        └─ CI：测试 → 构建 amd64+arm64 → 推 ghcr（tag 0.3.1 + latest）
+NAS：  改 compose 里的 image 版本 → docker compose pull && docker compose up -d
+```
+
+**不需要在 NAS 上 `docker build`**。仓库里的 `Dockerfile` 只服务于 CI 与排障时的本地构建。
 
 ### 环境变量
 
