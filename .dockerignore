@@ -1,0 +1,30 @@
+.git
+.github
+.gitignore
+.gitattributes
+.dockerignore
+
+# 运行产物 / 状态
+out
+data
+__pycache__
+**/__pycache__
+*.py[cod]
+
+# 本地环境与凭据
+.venv
+venv
+env
+.env
+.env.*
+
+# 编排文件不进镜像（由宿主机提供）
+docker-compose*.yml
+compose*.yml
+
+# 文档与临时脚本
+*.md
+!README.md
+_*
+nankeep_test
+tmp

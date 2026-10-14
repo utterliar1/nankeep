@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>nankeep · NanShare strm 库治理</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="wrap">
+
+  <div id="loginView" class="card hidden" style="max-width:420px;margin:12vh auto 0">
+    <h2>nankeep 登录</h2>
+    <p class="muted">NanShare strm 库治理 · 只读优先，删除需二次确认</p>
+    <div style="margin:12px 0"><input id="loginUser" type="text" placeholder="用户名" autocomplete="username"></div>
+    <div style="margin:12px 0"><input id="loginPw" type="password" placeholder="密码" autocomplete="current-password"></div>
+    <div class="banner err hidden" id="loginErr"></div>
+    <button class="primary" id="loginBtn" style="width:100%">登录</button>
+  </div>
+
+  <div id="appView" class="hidden">
+    <div class="spread" style="margin:6px 0 14px">
+      <div>
+        <h1>nankeep</h1>
+        <div class="muted mono" id="rootLabel"></div>
+      </div>
+      <div class="row">
+        <span class="muted" id="userLabel"></span>
+        <button class="ghost" id="logoutBtn">登出</button>
+      </div>
+    </div>
+
+    <div id="banner"></div>
+
+    <div class="card" id="taskbox">
+      <div class="spread">
+        <h2 style="margin:0">运行</h2>
+        <div class="row">
+          <button id="btnScan">扫描库</button>
+          <button id="btnReport">生成报告</button>
+          <select id="planKind">
+            <option value="movie">电影</option>
+            <option value="tv">剧集</option>
+          </select>
+          <select id="planConf">
+            <option value="weak">全部置信度</option>
+            <option value="medium">medium 及以上</option>
+            <option value="high">仅 high</option>
+            <option value="tie">仅 tie（等价版本，最安全）</option>
+          </select>
+          <button class="primary" id="btnPlan">生成计划</button>
+        </div>
+      </div>
+      <div id="taskArea" class="hidden" style="margin-top:12px">
+        <div class="progress"><i></i></div>
+        <div class="spread" style="margin-top:8px">
+          <span class="mono" id="taskLabel"></span>
+          <button class="ghost" id="btnCancel">取消</button>
+        </div>
+        <pre class="logs" id="taskLogs" style="max-height:180px;margin-top:8px"></pre>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>状态</h2>
+      <div class="kv" id="statusKv"></div>
+    </div>
+
+    <div class="card">
+      <div class="spread"><h2 style="margin:0">治理报告</h2>
+        <button class="ghost" id="btnReloadReport">刷新报告</button></div>
+      <div id="reportBox" class="muted" style="margin-top:10px">尚未生成报告，点上方「生成报告」。</div>
+    </div>
+
+    <div class="card">
+      <div class="spread"><h2 style="margin:0">治理计划</h2>
+        <button class="ghost" id="btnReloadPlans">刷新计划</button></div>
+      <div id="plansBox" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <div class="spread"><h2 style="margin:0">审计记录</h2>
+        <button class="ghost" id="btnReloadAudit">刷新</button></div>
+      <div id="auditBox" style="margin-top:10px"></div>
+    </div>
+
+    <details class="card" style="padding:0">
+      <summary style="padding:14px"><b>运行日志</b> <span class="muted" id="logHint"></span></summary>
+      <div class="body"><pre class="logs" id="logBox" style="max-height:300px"></pre></div>
+    </details>
+
+    <p class="muted" style="text-align:center;margin:18px 0 30px">
+      nankeep · 只读优先 · 删除走「复核 → 确认短语 → 执行」三步，计划一次性、2 小时过期
+    </p>
+  </div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

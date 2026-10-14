@@ -1,0 +1,59 @@
+services:
+  nankeep:
+    image: ghcr.io/utterliar1/nankeep:latest
+    container_name: nankeep
+    restart: unless-stopped
+
+    ports:
+      # 暴露到 NAS 局域网，供 iKuai 上的 Lucky 反向代理（跨主机）
+      - "8322:8322"
+
+    environment:
+      TZ: Asia/Shanghai
+
+      # ── 必改：登录凭据。密码为空则容器拒绝启动 ──
+      NANKEEP_USER: "admin"
+      NANKEEP_PASSWORD: "CHANGE_ME_TO_A_LONG_PASSWORD"
+
+      # 会话签名密钥。留空则回落到密码；建议单独设一串随机值，
+      # 这样改密码不会让已有会话失效。
+      NANKEEP_SESSION_SECRET: ""
+
+      # ── 库根（容器内路径，与下面 volumes 右侧保持一致）──
+      NANKEEP_ROOT: "/library"
+
+      # ── 删除闸门 ──
+      # 真删需要精确输入这句短语；可自行改成任何中文句子
+      NANKEEP_CONFIRM_PHRASE: "删除这些 strm 文件"
+      # 计划有效期（分钟）。过期即失效，防止「几周前的计划还照删」
+      NANKEEP_PLAN_TTL_MIN: "120"
+      # 会话有效期（天）
+      NANKEEP_SESSION_DAYS: "30"
+
+      # ── 反代访问时填浏览器地址栏的域名，逗号分隔 ──
+      # 例：NANKEEP_ALLOWED_ORIGINS: "https://nankeep.example.com"
+      # 不填则仅允许同源（直连 IP:8322 可正常用）
+      NANKEEP_ALLOWED_ORIGINS: ""
+
+    volumes:
+      # ① NanShare strm 库（读写：删除需要写权限；扫描只需读）
+      #    左侧改成你的真实路径，右侧保持 /library
+      - /path/to/nanshare:/library
+
+      # ② 状态目录：SQLite（计划 + 审计）、索引缓存、互斥锁
+      #    安装后需 chown 到 1000:1000，见 README
+      - ./data:/data
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8322/api/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
